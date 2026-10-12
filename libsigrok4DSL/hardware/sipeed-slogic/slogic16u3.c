@@ -1572,20 +1572,25 @@ static void slogic_finish_session(struct slogic_context *devc)
 	 * duration) from "the device stalled and the host drained a partial
 	 * buffer".
 	 */
-	if (devc->transfers_time_start && devc->transfers_time_latest) {
-		double stream_s =
+	if (devc->transfers_time_data && devc->transfers_time_latest) {
+		int64_t now = g_get_monotonic_time();
+		double data_s =
 			(double)(devc->transfers_time_latest -
-				 devc->transfers_time_start) / 1e6;
-		double total_s =
-			(double)(g_get_monotonic_time() -
-				 devc->transfers_time_start) / 1e6;
+				 devc->transfers_time_data) / 1e6;
 		double mb = (double)devc->transfers_received_bytes / 1e6;
 
-		sr_info("stream done: %.1f MB in %.3f s (%.0f MB/s), "
-			"%.3f MSa, host tail %.0f ms",
-			mb, stream_s, stream_s > 0.0 ? mb / stream_s : 0.0,
+		/* Rate over the data window only: slogic_avg_mbps starts the clock at
+		 * the first byte, so the arm/cold-start wake-up does not drag it. */
+		sr_info("stream done: %.1f MB in %.3f s (%.0f MB/s), %.3f MSa, "
+			"cold-start %.0f ms, host tail %.0f ms",
+			mb, data_s,
+			slogic_avg_mbps(devc->transfers_received_bytes,
+					devc->transfers_time_data,
+					devc->transfers_time_latest),
 			(double)devc->num_samples / 1e6,
-			(total_s - stream_s) * 1000.0);
+			(double)(devc->transfers_time_data -
+				 devc->transfers_time_start) / 1e3,
+			(double)(now - devc->transfers_time_latest) / 1e3);
 	}
 
 	sr_info("send SR_DF_END, samples=%" PRIu64, devc->num_samples);
