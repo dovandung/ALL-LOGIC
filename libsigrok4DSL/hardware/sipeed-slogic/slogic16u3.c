@@ -2350,7 +2350,8 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 	devc->fast_pending_len = 0;
 	devc->filt_have_prev = 0;
 	devc->stream_res_len = 0;
-	devc->drop_left = SLOGIC_DROP_FIRST_BYTES;
+	devc->drop_left = devc->model ? devc->model->first_drop_bytes
+				      : SLOGIC_DROP_FIRST_BYTES; /* per-model HW quirk */
 	devc->raw_received_bytes = 0;
 	devc->samples_need_bytes = 0;
 	devc->transfers = NULL;
