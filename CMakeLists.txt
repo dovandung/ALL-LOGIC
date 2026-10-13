@@ -511,6 +511,8 @@ set(libsigrok4DSL_SOURCES
     libsigrok4DSL/hardware/sipeed-slogic/slogic/slogic8u2.c
     libsigrok4DSL/hardware/sipeed-slogic/slogic/slogic16u3.c
     libsigrok4DSL/hardware/sipeed-slogic/slogic/slogic32u3.c
+    libsigrok4DSL/hardware/sipeed-slogic/slogic/slogic_data.c
+    libsigrok4DSL/hardware/sipeed-slogic/slogic/slogic_usb.c
     libsigrok4DSL/hardware/pxlogic/usb_ctrl.c
     libsigrok4DSL/hardware/pxlogic/pxlogic.c
     libsigrok4DSL/hardware/atk-logic/atk_logic.c
@@ -524,6 +526,7 @@ set(libsigrok4DSL_SOURCES
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set_source_files_properties(
         libsigrok4DSL/hardware/sipeed-slogic/slogic16u3.c
+        libsigrok4DSL/hardware/sipeed-slogic/slogic/slogic_data.c
         PROPERTIES COMPILE_OPTIONS "-O3")
 endif()
 

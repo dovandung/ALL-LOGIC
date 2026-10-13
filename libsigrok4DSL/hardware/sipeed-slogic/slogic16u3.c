@@ -35,44 +35,11 @@
 #define LOG_PREFIX "slogic16u3: "
 
 
-#define SLOGIC_EP_COMBO8_IN      0x81
-#define SLOGIC_EP_U3_IN           0x82
-
-#define SLOGIC_REQ_REG_READ      0x00
-#define SLOGIC_REQ_REG_WRITE     0x01
-
-#define SLOGIC_R32_CTRL          0x0004
-#define SLOGIC_R32_AUX           0x000C
-
-#define SLOGIC_CTRL_STOP         0x00000000u
-#define SLOGIC_CTRL_RUN          0x00000001u
-#define SLOGIC_CTRL_RST          0x00000002u
-
-#define SLOGIC_AUX_CMD_CHANNEL   0x00000001u
-#define SLOGIC_AUX_CMD_RATE      0x00000002u
-#define SLOGIC_AUX_CMD_VREF      0x00000003u
-#define SLOGIC_AUX_CMD_TEST      0x00000005u
-
-#define SLOGIC_COMBO8_CMD_START  0xb1
-#define SLOGIC_CTRL_TIMEOUT_MS   500
-#define SLOGIC_MAX_TRANSFERS     16
-#define SLOGIC_TRANSFER_SIZE_MIN (32 * 1024)
-#define SLOGIC_TRANSFER_SIZE_MAX (3 * 1024 * 1024)
+/* Bulk transfer sizing for the convert staging buffer. */
 #define SLOGIC_TRANSFER_ALIGN    (32 * 1024)
-#define SLOGIC_TRANSFER_TOLERANCE 0.30
 
 /* Upper bound on helper threads used to convert the wire format. */
 #define SLOGIC_MAX_CONV_THREADS 8
-/* The U3 firmware occasionally misses the RUN command and then never streams
- * anything; re-issue it this many times before giving up on the capture. */
-#define SLOGIC_MAX_START_RETRIES 1
-#define SLOGIC_DROP_FIRST_BYTES  4
-/* Once data is flowing, a transfer that arrives late only means the host is
- * draining slower than the analyzer produces (USB backpressure), which is
- * normal for long captures.  Only treat the link as dead when nothing at all
- * arrives for this long. */
-#define SLOGIC_STREAM_IDLE_US    1000000
-
 #define SLOGIC_DEFAULT_SAMPLES   SR_Mn(1)
 #define SLOGIC_HW_DEPTH          SR_Mn(128)
 #define SLOGIC_MAX_PHYS_CH       32
@@ -210,41 +177,12 @@ struct slogic_context {
 	int filt_have_prev;
 
 	volatile gint status;
-	volatile gint abort;
-	volatile gint fw_streaming;
-	volatile gint callbacks_active;
-	int submitted_transfers;
-	int num_transfers;
-	struct libusb_transfer **transfers;
-	int freewheel;
-	GThread *libusb_event_thread;
-	volatile gint libusb_event_thread_run;
-	GMutex transfer_lock;
-	GAsyncQueue *raw_queue;
 	int source_added;
 	int end_sent;
-	int user_stop;
-	volatile gint discard_queue;
-	int hw_stop_attempts;
-	uint64_t samples_need_bytes;
-	uint64_t raw_received_bytes;
-	uint64_t transfer_size;
-	uint64_t transfer_duration_ms;
-	uint64_t expected_rate_bytes;
-	uint64_t transfers_completed;
-	uint64_t transfers_received_bytes;
-	uint64_t transfers_received_bytes_latest;
-	int64_t transfers_time_start;
-	int64_t transfers_time_latest;
-	int64_t transfers_time_data;
-	unsigned int timeout_count;
-	unsigned int timeout_count_limit;
-	int slow_warned;
-	int silent_abort;
-	volatile gint restart_pending;
-	volatile gint start_retries;
 
-	int drop_left;
+	/* libslogic core: owns the handle, event thread, ring and accounting. */
+	slogic_dev *sdev;
+	slogic_capture *cap;
 
 	uint32_t *raw_pending;
 	int raw_pending_len;
@@ -276,12 +214,6 @@ SR_PRIV struct sr_dev_driver slogic16u3_driver_info;
 static struct sr_dev_driver *di = &slogic16u3_driver_info;
 
 /* -------------------- USB / speed -------------------- */
-
-static int slogic_is_usb3(const struct slogic_context *devc)
-{
-	return devc && (devc->usb_speed == LIBUSB_SPEED_SUPER ||
-			devc->usb_speed == LIBUSB_SPEED_SUPER_PLUS);
-}
 
 static const char *slogic_speed_name(enum libusb_speed sp)
 {
@@ -316,29 +248,32 @@ static int slogic_mode_channels(const struct slogic_context *devc, int mode)
 	return (devc->model->physical_channels >> (mode));
 }
 
-static uint64_t slogic_link_max_rate(const struct slogic_context *devc)
+/* Link-aware ceiling for the current channel mode (USB2 cap in the core). */
+static slogic_link al_link(const struct slogic_context *devc)
 {
-	const struct slogic_model *model = devc ? devc->model : NULL;
-	int mode = devc ? devc->ch_mode : 0;
-	uint64_t limit;
+	return (devc && devc->usb_dev) ? slogic_usb_link(devc->usb_dev)
+				       : SLOGIC_LINK_UNKNOWN;
+}
 
-	if (!model)
-		model = slogic_model_for_pid(SLOGIC_PID_16U3);
+static const struct slogic_model *al_model(const struct slogic_context *devc)
+{
+	return (devc && devc->model) ? devc->model
+				     : slogic_model_for_pid(SLOGIC_PID_16U3);
+}
+
+static int al_nch(const struct slogic_context *devc)
+{
+	const struct slogic_model *model = al_model(devc);
+	int mode = devc ? devc->ch_mode : 0;
+
 	if (mode < 0 || (size_t)mode >= model->limit_count)
 		mode = 0;
+	return model->physical_channels >> mode;
+}
 
-	/* The reference driver publishes one limit for each channel mode. */
-	limit = slogic_max_rate(model, model->physical_channels >> (mode));
-	/* U3 analyzers also enumerate through USB high-speed.  Keep the rate
-	 * within the practical USB2 payload limit when the link is known. */
-	if (devc && model->proto == SLOGIC_PROTO_U3 &&
-		devc->usb_speed != LIBUSB_SPEED_UNKNOWN && !slogic_is_usb3(devc)) {
-		int nch = (model->physical_channels >> (mode));
-		uint64_t usb2_limit = SR_MHZ(320) / (uint64_t)nch;
-		if (limit > usb2_limit)
-			limit = usb2_limit;
-	}
-	return limit;
+static uint64_t al_link_max_rate(const struct slogic_context *devc)
+{
+	return slogic_link_max_rate(al_model(devc), al_nch(devc), al_link(devc));
 }
 
 static void slogic_apply_model_name(struct sr_dev_inst *sdi,
@@ -374,118 +309,37 @@ static void slogic_update_usb_speed(struct slogic_context *devc)
 					devc->model, sp);
 }
 
-static uint64_t slogic_pick_rate(const struct slogic_context *devc,
-					 uint64_t want)
+static uint64_t al_pick_rate(const struct slogic_context *devc, uint64_t want)
 {
-	unsigned int i;
-	const struct slogic_model *model = devc && devc->model ?
-		devc->model : slogic_model_for_pid(SLOGIC_PID_16U3);
-	uint64_t link_max = slogic_link_max_rate(devc);
-	uint64_t best = 0;
-	uint64_t best_err = UINT64_MAX;
-
-	if (want == 0)
-		want = link_max;
-	if (want > link_max)
-		want = link_max;
-
-	for (i = 0; i < model->rate_count; i++) {
-		uint64_t r = model->rates[i];
-		uint64_t err;
-
-		if (r > link_max)
-			continue;
-		err = (r > want) ? (r - want) : (want - r);
-		if (err < best_err) {
-			best_err = err;
-			best = r;
-		}
-	}
-	if (!best)
-		best = model->rates[0];
-	return best;
+	return slogic_pick_rate(al_model(devc), al_nch(devc), al_link(devc), want, 0);
 }
 
 static void slogic_map_samplerate(struct slogic_context *devc, uint64_t want)
 {
-	devc->samplerate = slogic_pick_rate(devc, want);
-}
-
-static int slogic_rate_list_add(uint64_t *out, int n, int cap, uint64_t r)
-{
-	int i, j;
-
-	if (n >= cap)
-		return n;
-	for (i = 0; i < n; i++) {
-		if (out[i] == r)
-			return n;
-		if (out[i] < r)
-			break;
-	}
-	for (j = n; j > i; j--)
-		out[j] = out[j - 1];
-	out[i] = r;
-	return n + 1;
+	devc->samplerate = al_pick_rate(devc, want);
 }
 
 static void slogic_build_rate_list(const struct slogic_context *devc,
 				   uint64_t *out, int *out_n)
 {
 	/* The caller must size `out` for the whole list (32 entries max) plus
-	 * the 0 terminator written below. */
-	uint64_t link_max = slogic_link_max_rate(devc);
-	const struct slogic_model *model = devc && devc->model ?
-		devc->model : slogic_model_for_pid(SLOGIC_PID_16U3);
-	unsigned int i;
-	int n = 0;
-	const int cap = 32;
+	 * the 0 terminator written below. DSView lists rates highest first. */
+	uint64_t asc[32];
+	size_t n = slogic_rate_list(al_model(devc), al_nch(devc), al_link(devc),
+				    asc, 32);
+	size_t i;
 
-	for (i = 0; i < model->rate_count; i++) {
-		if (model->rates[i] <= link_max)
-			n = slogic_rate_list_add(out, n, cap, model->rates[i]);
-	}
+	for (i = 0; i < n; i++)
+		out[i] = asc[n - 1 - i];
 	out[n] = 0;
-	*out_n = n;
+	*out_n = (int)n;
 }
 
-/* -------------------- register / AUX -------------------- */
-
-/* Combo 8 has a small command protocol rather than the U3 register map. */
-/* -------------------- shared-core transport shim (P2) --------------------
- * The register/AUX protocol lives once in the vendored slogic/ core; this
- * adapter only provides the USB control-transfer transport and maps the
- * DSView-side config into a slogic_config, then calls slogic_reset/configure/
- * run/stop. */
-static int al_ctrl_write(void *ctx, uint8_t b_request, uint16_t w_value,
-			 uint16_t w_index, const uint8_t *data,
-			 uint16_t len, unsigned timeout_ms)
-{
-	struct slogic_context *devc = ctx;
-
-	return libusb_control_transfer(devc->devhdl,
-		LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT, b_request,
-		w_value, w_index, (unsigned char *)data, len, (int)timeout_ms);
-}
-
-static int al_ctrl_read(void *ctx, uint8_t b_request, uint16_t w_value,
-			uint16_t w_index, uint8_t *data, uint16_t len,
-			unsigned timeout_ms)
-{
-	struct slogic_context *devc = ctx;
-
-	return libusb_control_transfer(devc->devhdl,
-		LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN, b_request,
-		w_value, w_index, data, len, (int)timeout_ms);
-}
-
-static void al_transport(struct slogic_context *devc, slogic_transport *t)
-{
-	t->ctx = devc;
-	t->control_write = al_ctrl_write;
-	t->control_read = al_ctrl_read;
-}
-
+/* -------------------- libslogic core glue --------------------
+ * The device, the transfer ring, stall recovery, exact sample accounting and
+ * the throughput report live in the vendored slogic/ core. This driver maps
+ * the DSView config onto it and turns the delivered samples (1 byte per
+ * sample below 8 channels, else channels/8) into LA_CROSS_DATA. */
 static void al_config(struct slogic_context *devc, slogic_config *c)
 {
 	*c = (slogic_config){
@@ -496,89 +350,16 @@ static void al_config(struct slogic_context *devc, slogic_config *c)
 	};
 }
 
-static int slogic_hw_reset(struct slogic_context *devc)
+static void al_log(void *user, int level, const char *msg)
 {
-	slogic_transport t;
-
-	if (!devc || !devc->model)
-		return SR_ERR_ARG;
-	al_transport(devc, &t);
-	return slogic_reset(devc->model, &t) == SLOGIC_OK ? SR_OK : SR_ERR;
-}
-
-static void slogic_drain_ep(struct slogic_context *devc);
-
-static int slogic_hw_start(struct slogic_context *devc)
-{
-	slogic_transport t;
-	slogic_config c;
-
-	if (!devc || !devc->model)
-		return SR_ERR_ARG;
-	al_transport(devc, &t);
-	al_config(devc, &c);
-	/* U3 writes CTRL=RUN; Combo 8 carries rate + channel count in its start
-	 * command (the core handles both from the config). */
-	return slogic_run(devc->model, &t, &c) == SLOGIC_OK ? SR_OK : SR_ERR;
-}
-
-static void slogic_hw_stop(struct slogic_context *devc)
-{
-	int ret;
-
-	if (!devc || !g_atomic_int_get(&devc->fw_streaming))
-		return;
-	if (!devc->devhdl) {
-		g_atomic_int_set(&devc->fw_streaming, 0);
-		return;
+	(void)user;
+	switch (level) {
+	case SLOGIC_LOG_ERR: sr_err("%s", msg); break;
+	case SLOGIC_LOG_WARN: sr_warn("%s", msg); break;
+	case SLOGIC_LOG_INFO: sr_info("%s", msg); break;
+	case SLOGIC_LOG_DBG: sr_dbg("%s", msg); break;
+	default: break;
 	}
-	if (devc->model && devc->model->proto == SLOGIC_PROTO_COMBO8) {
-		/* CMD_STOP is unreliable in current Combo8 firmware; draining EP1
-		 * is the upstream driver's documented stop sequence. */
-		slogic_drain_ep(devc);
-		g_atomic_int_set(&devc->fw_streaming, 0);
-		return;
-	}
-	{
-		slogic_transport t;
-		al_transport(devc, &t);
-		ret = slogic_stop(devc->model, &t) == SLOGIC_OK ? SR_OK : SR_ERR;
-	}
-	if (ret != SR_OK) {
-		devc->hw_stop_attempts++;
-		sr_err("HW stop failed, will retry (%d/10)",
-			devc->hw_stop_attempts);
-		if (devc->hw_stop_attempts >= 10) {
-			sr_err("HW stop unavailable; completing host session");
-			g_atomic_int_set(&devc->fw_streaming, 0);
-		}
-	} else {
-		devc->hw_stop_attempts = 0;
-		g_atomic_int_set(&devc->fw_streaming, 0);
-		sr_info("HW stop sent");
-	}
-}
-
-static void slogic_drain_ep(struct slogic_context *devc)
-{
-	uint8_t *tmp;
-	int xfer;
-	int r;
-	int loops = 0;
-
-	if (!devc || !devc->devhdl)
-		return;
-	tmp = g_try_malloc(64 * 1024);
-	if (!tmp)
-		return;
-	do {
-		xfer = 0;
-		r = libusb_bulk_transfer(devc->devhdl,
-				 devc->model ? devc->model->ep_in : SLOGIC_EP_U3_IN, tmp,
-				 64 * 1024, &xfer, 50);
-		loops++;
-	} while (r == 0 && xfer > 0 && loops < 32);
-	g_free(tmp);
 }
 
 /* -------------------- probes / convert -------------------- */
@@ -681,10 +462,9 @@ static int slogic_push_sample(struct slogic_context *devc, uint32_t s)
 }
 
 /*
- * Unpack the wire stream into parallel samples (bit i = Di).
- * Samples below eight channels are bit-packed (2-channel: four samples per
- * byte, 4-channel: two samples per byte).  Eight, sixteen and thirty-two
- * channel modes use one, two and four little-endian bytes per sample.
+ * Collect delivered samples as parallel words (bit i = Di). Below eight
+ * channels the core delivers one sample per byte; eight, sixteen and
+ * thirty-two channel modes use one, two and four little-endian bytes.
  */
 static int slogic_unpack_append(struct slogic_context *devc,
 				const uint8_t *raw, int raw_len)
@@ -702,16 +482,11 @@ static int slogic_unpack_append(struct slogic_context *devc,
 		return SR_ERR_ARG;
 
 	if (nch < 8) {
-		const int samples_per_byte = 8 / nch;
+		/* The core already unpacked these: one sample per byte. */
 		mask = (UINT32_C(1) << nch) - 1u;
 		while (left-- > 0) {
-			uint8_t b = *p++;
-			int i;
-			for (i = 0; i < samples_per_byte; i++) {
-				if (slogic_push_sample(devc,
-						((uint32_t)b >> (i * nch)) & mask) != SR_OK)
-					return SR_ERR_MALLOC;
-			}
+			if (slogic_push_sample(devc, *p++ & mask) != SR_OK)
+				return SR_ERR_MALLOC;
 		}
 		return SR_OK;
 	}
@@ -1074,486 +849,25 @@ static int slogic_convert_slow(struct slogic_context *devc,
 static int slogic_convert_push(struct slogic_context *devc,
 			       const uint8_t *raw, int raw_len)
 {
-	if (devc->channel_count >= 8 && devc->filter == SR_FILTER_NONE)
+	/* Every mode arrives as whole bytes per sample now, so the fast
+	 * transpose covers them all; only the 1T filter needs the slow path. */
+	if (devc->filter == SR_FILTER_NONE)
 		return slogic_convert_fast(devc, raw, raw_len);
 	return slogic_convert_slow(devc, raw, raw_len);
 }
 
-/* -------------------- transfers -------------------- */
+/* -------------------- capture -------------------- */
 
-static void slogic_cancel_transfers(struct slogic_context *devc)
+static int al_sink_data(void *user, const uint8_t *samples, size_t n,
+			unsigned unitsize)
 {
-	unsigned int i;
+	struct slogic_context *devc = user;
 
-	if (!devc)
-		return;
-	g_mutex_lock(&devc->transfer_lock);
-	for (i = 0; i < (unsigned)devc->num_transfers &&
-		    i < SLOGIC_MAX_TRANSFERS; i++) {
-		if (devc->transfers && devc->transfers[i])
-			/* Keep the pointer alive until libusb has accepted the cancel. */
-			libusb_cancel_transfer(devc->transfers[i]);
+	if (slogic_convert_push(devc, samples, (int)(n * unitsize)) != SR_OK) {
+		sr_err("format convert failed");
+		return 1; /* ends the capture */
 	}
-	g_mutex_unlock(&devc->transfer_lock);
-}
-
-static int slogic_submitted_count(struct slogic_context *devc)
-{
-	int n;
-
-	g_mutex_lock(&devc->transfer_lock);
-	n = devc->submitted_transfers;
-	g_mutex_unlock(&devc->transfer_lock);
-	return n;
-}
-
-static int slogic_active_callbacks(struct slogic_context *devc)
-{
-	return g_atomic_int_get(&devc->callbacks_active);
-}
-
-static void slogic_clear_raw_queue(struct slogic_context *devc)
-{
-	GByteArray *array;
-
-	if (!devc || !devc->raw_queue)
-		return;
-	while ((array = g_async_queue_try_pop(devc->raw_queue)) != NULL)
-		g_byte_array_unref(array);
-}
-
-/* Remove a completed transfer from the live set. The array itself remains
- * allocated until the session callback has observed that all callbacks have
- * returned. */
-static void slogic_transfer_done(struct slogic_context *devc,
-				 struct libusb_transfer *transfer)
-{
-	unsigned int i;
-
-	g_mutex_lock(&devc->transfer_lock);
-	for (i = 0; i < (unsigned)devc->num_transfers; i++) {
-		if (devc->transfers && devc->transfers[i] == transfer) {
-			devc->transfers[i] = NULL;
-			if (devc->submitted_transfers > 0)
-				devc->submitted_transfers--;
-			break;
-		}
-	}
-	g_mutex_unlock(&devc->transfer_lock);
-
-	g_free(transfer->buffer);
-	transfer->buffer = NULL;
-	libusb_free_transfer(transfer);
-}
-
-static void slogic_request_acq_stop(struct slogic_context *devc,
-					gboolean discard)
-{
-	if (!devc)
-		return;
-	g_atomic_int_set(&devc->abort, 1);
-	devc->status = SLOGIC_ST_STOP;
-	if (discard)
-		g_atomic_int_set(&devc->discard_queue, 1);
-	slogic_cancel_transfers(devc);
-}
-
-static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
-{
-	struct slogic_context *devc = transfer ? transfer->user_data : NULL;
-	uint8_t *owned = NULL;
-	int len = 0;
-	int ret;
-	int64_t now;
-	int64_t delta;
-	gboolean resubmit = FALSE;
-	gboolean queued = FALSE;
-	gboolean reached_limit = FALSE;
-
-	if (!devc || !transfer)
-		return;
-	g_atomic_int_inc(&devc->callbacks_active);
-
-	now = g_get_monotonic_time();
-	delta = devc->transfers_time_latest ?
-		now - devc->transfers_time_latest : 0;
-	devc->transfers_completed++;
-	devc->transfers_time_latest = now;
-
-	if (transfer->status == LIBUSB_TRANSFER_COMPLETED ||
-	    transfer->status == LIBUSB_TRANSFER_TIMED_OUT) {
-		len = transfer->actual_length;
-		if (len > 0) {
-			if (devc->drop_left > 0) {
-				int drop = len < devc->drop_left ? len : devc->drop_left;
-				memmove(transfer->buffer, transfer->buffer + drop,
-					(size_t)(len - drop));
-				len -= drop;
-				devc->drop_left -= drop;
-			}
-			if (!devc->is_loop && devc->samples_need_bytes > 0) {
-				uint64_t room = devc->samples_need_bytes >
-					devc->raw_received_bytes ?
-					devc->samples_need_bytes -
-					devc->raw_received_bytes : 0;
-				if ((uint64_t)len > room)
-					len = (int)room;
-			}
-			if (len > 0) {
-				devc->raw_received_bytes += (uint64_t)len;
-				devc->transfers_received_bytes_latest = (uint64_t)len;
-				devc->transfers_received_bytes += (uint64_t)len;
-				if (devc->raw_queue &&
-				    !g_atomic_int_get(&devc->discard_queue)) {
-					owned = transfer->buffer;
-					transfer->buffer = NULL;
-					GByteArray *array =
-						g_byte_array_new_take(owned, (gsize)len);
-					if (array) {
-						g_async_queue_push(devc->raw_queue, array);
-						queued = TRUE;
-					} else {
-						g_free(owned);
-						owned = NULL;
-						g_atomic_int_set(&devc->abort, 1);
-						g_atomic_int_set(&devc->discard_queue, 1);
-					}
-				}
-			}
-			if (!devc->is_loop && devc->samples_need_bytes > 0 &&
-			    devc->raw_received_bytes >= devc->samples_need_bytes) {
-				reached_limit = TRUE;
-				g_atomic_int_set(&devc->abort, 1);
-				devc->status = SLOGIC_ST_STOP;
-			}
-		}
-		/*
-		 * Throughput guard. The reference driver evaluates this for every
-		 * transfer, including the ones that complete with zero bytes.
-		 * Keeping it inside the "len > 0" branch above meant a device that
-		 * never started streaming just timed out silently and was
-		 * resubmitted forever, so the capture hung in "capturing" with no
-		 * data and no way out but a manual stop.
-		 */
-		if (!g_atomic_int_get(&devc->abort) &&
-		    devc->transfers_completed > 1 && delta > 0) {
-			double expected_us =
-				(double)devc->transfer_size * 1000000.0 /
-				(double)devc->expected_rate_bytes;
-			double actual_rate = (double)len * 1000000.0 /
-				(double)delta;
-			if ((double)delta > (SLOGIC_TRANSFER_TOLERANCE + 1.0) *
-				    expected_us ||
-			    actual_rate < (1.0 - SLOGIC_TRANSFER_TOLERANCE) *
-				    (double)devc->expected_rate_bytes)
-				devc->timeout_count++;
-			else
-				devc->timeout_count = 0;
-			if (len > 0)
-				devc->transfers_time_data = now;
-
-			/*
-			 * The reference driver treats "transfer was slower than
-			 * expected" as a fatal stall on every transfer.  That
-			 * is right while no data has arrived at all (the RUN
-			 * command was swallowed), but wrong once the stream is
-			 * running: 32ch@200MHz makes the host the bottleneck,
-			 * the analyzer throttles itself, and later transfers
-			 * legitimately look slow.  Aborting there truncated
-			 * long captures (4 s of samples ended after 621 MSa,
-			 * while sigrok-cli finished the same request).  So
-			 * once bytes have started flowing, only complete
-			 * silence for SLOGIC_STREAM_IDLE_US is fatal;
-			 * slow-but-alive just gets one warning.
-			 */
-			if (devc->raw_received_bytes > 0) {
-				int64_t idle_us = devc->transfers_time_data ?
-					now - devc->transfers_time_data :
-					now - devc->transfers_time_start;
-
-				if (idle_us > SLOGIC_STREAM_IDLE_US) {
-					devc->timeout_count =
-						devc->timeout_count_limit + 1;
-					devc->silent_abort = 1;
-				} else {
-					devc->timeout_count = 0;
-				}
-				if (!devc->slow_warned &&
-				    (double)delta >
-					    (SLOGIC_TRANSFER_TOLERANCE + 1.0) *
-						    expected_us) {
-					devc->slow_warned = 1;
-					sr_dbg("USB link slower than the "
-						"analyzer (%.0f MB/s): draining "
-						"at the host's pace",
-						actual_rate / 1000000.0);
-				}
-			}
-			if (devc->timeout_count >= devc->timeout_count_limit) {
-				if (devc->raw_received_bytes == 0 &&
-				    g_atomic_int_get(&devc->start_retries) <
-					    SLOGIC_MAX_START_RETRIES &&
-				    !g_atomic_int_get(&devc->restart_pending)) {
-					/* The firmware sometimes swallows the RUN
-					 * command and then never streams. Ask the
-					 * collect thread to re-arm instead of
-					 * handing the user an empty capture. */
-					sr_warn("USB stream did not start after "
-						"%" PRIu64 " transfers, re-arming "
-						"hardware",
-						(uint64_t)devc->timeout_count);
-					devc->timeout_count = 0;
-					devc->transfers_completed = 0;
-					devc->transfers_time_latest = 0;
-					g_atomic_int_set(&devc->restart_pending, 1);
-				} else {
-					if (devc->raw_received_bytes == 0)
-						sr_err("USB stream never started: no data in "
-							"%" PRIu64 " consecutive transfers, "
-							"aborting capture",
-							(uint64_t)devc->timeout_count);
-					else if (devc->silent_abort)
-						sr_err("USB stream went silent mid-capture: "
-							"no data for more than %d ms, "
-							"aborting after %" PRIu64 " samples",
-							(int)(SLOGIC_STREAM_IDLE_US / 1000),
-							devc->num_samples);
-					else
-						sr_err("USB transfer stalled: %.2f MB/s, "
-							"%" PRIu64 " consecutive slow transfers",
-							actual_rate / 1000000.0,
-							(uint64_t)devc->timeout_count);
-					g_atomic_int_set(&devc->abort, 1);
-					devc->status = SLOGIC_ST_STOP;
-					g_atomic_int_set(&devc->discard_queue, 1);
-				}
-			}
-		}
-	} else {
-		gboolean expected_cancel = g_atomic_int_get(&devc->abort);
-
-		if (!expected_cancel) {
-			sr_err("bulk transfer status %d (%s)", transfer->status,
-				libusb_error_name(transfer->status));
-			g_atomic_int_set(&devc->discard_queue, 1);
-		}
-		g_atomic_int_set(&devc->abort, 1);
-		devc->status = SLOGIC_ST_STOP;
-	}
-
-	/* USB callbacks only move completed buffers to the queue. All expensive
-	 * conversion and UI delivery happens in receive_data(). */
-	if (!g_atomic_int_get(&devc->abort) && !reached_limit) {
-		if (!transfer->buffer)
-			transfer->buffer = g_try_malloc((gsize)devc->transfer_size);
-		if (transfer->buffer) {
-			transfer->actual_length = 0;
-			transfer->length = (int)devc->transfer_size;
-			transfer->timeout = (unsigned int)(
-				(SLOGIC_TRANSFER_TOLERANCE + 1.0) *
-				devc->transfer_duration_ms * 4.0);
-			if (transfer->timeout < 10)
-				transfer->timeout = 10;
-			ret = libusb_submit_transfer(transfer);
-			if (ret == 0)
-				resubmit = TRUE;
-			else {
-				sr_err("resubmit failed: %s", libusb_error_name(ret));
-				g_atomic_int_set(&devc->abort, 1);
-				devc->status = SLOGIC_ST_STOP;
-				g_atomic_int_set(&devc->discard_queue, 1);
-			}
-		} else {
-			sr_err("unable to allocate replacement USB buffer");
-			g_atomic_int_set(&devc->abort, 1);
-			devc->status = SLOGIC_ST_STOP;
-			g_atomic_int_set(&devc->discard_queue, 1);
-		}
-	}
-
-	if (!resubmit) {
-		if (owned && !queued)
-			g_free(owned);
-		slogic_transfer_done(devc, transfer);
-	}
-	g_atomic_int_dec_and_test(&devc->callbacks_active);
-}
-
-static uint64_t slogic_wire_bytes_per_second(const struct slogic_context *devc)
-{
-	uint64_t channels = devc->channel_count > 0 ?
-		(uint64_t)devc->channel_count : 1;
-
-	return (devc->samplerate * channels + 7) / 8;
-}
-
-static uint64_t slogic_pick_transfer_size(struct slogic_context *devc)
-{
-	uint64_t rate = slogic_wire_bytes_per_second(devc);
-	uint64_t size = (rate * 4 + 999) / 1000; /* approximately 4 ms */
-
-	if (size < SLOGIC_TRANSFER_SIZE_MIN)
-		size = SLOGIC_TRANSFER_SIZE_MIN;
-	if (size > SLOGIC_TRANSFER_SIZE_MAX)
-		size = SLOGIC_TRANSFER_SIZE_MAX;
-	size = (size + SLOGIC_TRANSFER_ALIGN - 1) &
-		~(uint64_t)(SLOGIC_TRANSFER_ALIGN - 1);
-	if (size > SLOGIC_TRANSFER_SIZE_MAX)
-		size = SLOGIC_TRANSFER_SIZE_MAX;
-	return size;
-}
-
-static void slogic_update_transfer_timing(struct slogic_context *devc)
-{
-	devc->transfer_duration_ms =
-		(devc->transfer_size * 1000 + devc->expected_rate_bytes - 1) /
-		devc->expected_rate_bytes;
-	if (devc->transfer_duration_ms == 0)
-		devc->transfer_duration_ms = 1;
-}
-
-static int start_transfers(struct slogic_context *devc)
-{
-	uint64_t need = devc->samples_need_bytes;
-	uint64_t nneed;
-	int i;
-
-	devc->transfer_size = slogic_pick_transfer_size(devc);
-	devc->expected_rate_bytes = slogic_wire_bytes_per_second(devc);
-	if (devc->expected_rate_bytes == 0)
-		devc->expected_rate_bytes = 1;
-	slogic_update_transfer_timing(devc);
-
-	devc->raw_queue = g_async_queue_new();
-	if (!devc->raw_queue)
-		return SR_ERR_MALLOC;
-	devc->transfers = g_try_malloc0(sizeof(*devc->transfers) *
-					SLOGIC_MAX_TRANSFERS);
-	if (!devc->transfers)
-		return SR_ERR_MALLOC;
-	devc->num_transfers = SLOGIC_MAX_TRANSFERS;
-	devc->submitted_transfers = 0;
-	devc->transfers_completed = 0;
-	devc->transfers_received_bytes = 0;
-	devc->transfers_time_start = g_get_monotonic_time();
-	devc->transfers_time_latest = devc->transfers_time_start;
-	devc->transfers_time_data = 0;
-	devc->slow_warned = 0;
-	devc->silent_abort = 0;
-	devc->timeout_count = 0;
-
-	if (need && !devc->is_loop) {
-		nneed = (need + devc->transfer_size - 1) / devc->transfer_size;
-		if (nneed < 4)
-			nneed = 4;
-		if (nneed > SLOGIC_MAX_TRANSFERS)
-			nneed = SLOGIC_MAX_TRANSFERS;
-	} else {
-		nneed = SLOGIC_MAX_TRANSFERS;
-	}
-	devc->timeout_count_limit = (unsigned int)nneed;
-
-	for (i = 0; i < (int)nneed; i++) {
-		struct libusb_transfer *xfer;
-		unsigned char *buf;
-		int ret;
-		unsigned int timeout;
-
-		buf = g_try_malloc((gsize)devc->transfer_size);
-		if (!buf) {
-			if (i == 0 &&
-			    devc->transfer_size > SLOGIC_TRANSFER_SIZE_MIN) {
-				devc->transfer_size >>= 1;
-				devc->transfer_size &= ~(uint64_t)(SLOGIC_TRANSFER_ALIGN - 1);
-				slogic_update_transfer_timing(devc);
-				i--;
-				continue;
-			}
-			break;
-		}
-		xfer = libusb_alloc_transfer(0);
-		if (!xfer) {
-			g_free(buf);
-			break;
-		}
-		timeout = (unsigned int)((SLOGIC_TRANSFER_TOLERANCE + 1.0) *
-			devc->transfer_duration_ms * (i + 2));
-		if (timeout < 10)
-			timeout = 10;
-		libusb_fill_bulk_transfer(xfer, devc->devhdl,
-			devc->model ? devc->model->ep_in : SLOGIC_EP_U3_IN,
-			buf, (int)devc->transfer_size, receive_transfer, devc,
-			timeout);
-		g_mutex_lock(&devc->transfer_lock);
-		devc->transfers[i] = xfer;
-		devc->submitted_transfers++;
-		g_mutex_unlock(&devc->transfer_lock);
-		ret = libusb_submit_transfer(xfer);
-		if (ret != 0) {
-			if (ret == LIBUSB_ERROR_NO_MEM && i > 0)
-				sr_dbg("USB kernel accepted %u large transfers", i);
-			else if (ret == LIBUSB_ERROR_NO_MEM &&
-				 devc->transfer_size > SLOGIC_TRANSFER_SIZE_MIN) {
-				g_mutex_lock(&devc->transfer_lock);
-				devc->transfers[i] = NULL;
-				if (devc->submitted_transfers > 0)
-					devc->submitted_transfers--;
-				g_mutex_unlock(&devc->transfer_lock);
-				g_free(xfer->buffer);
-				xfer->buffer = NULL;
-				libusb_free_transfer(xfer);
-				devc->transfer_size >>= 1;
-				devc->transfer_size &= ~(uint64_t)(SLOGIC_TRANSFER_ALIGN - 1);
-				slogic_update_transfer_timing(devc);
-				i--;
-				continue;
-			} else
-				sr_err("submit transfer %d failed: %s", i,
-					libusb_error_name(ret));
-			g_mutex_lock(&devc->transfer_lock);
-			devc->transfers[i] = NULL;
-			if (devc->submitted_transfers > 0)
-				devc->submitted_transfers--;
-			g_mutex_unlock(&devc->transfer_lock);
-			g_free(xfer->buffer);
-			xfer->buffer = NULL;
-			libusb_free_transfer(xfer);
-			break;
-		}
-	}
-
-	if (slogic_submitted_count(devc) == 0)
-		return SR_ERR;
-	devc->timeout_count_limit =
-		(unsigned int)slogic_submitted_count(devc);
-	sr_info("USB pipeline: %d transfers x %" PRIu64
-		" bytes (%.2f ms each)",
-		slogic_submitted_count(devc), devc->transfer_size,
-		(double)devc->transfer_duration_ms);
-	return SR_OK;
-}
-
-static void slogic_abort_startup(struct slogic_context *devc)
-{
-	int wait_ms = 0;
-
-	if (!devc)
-		return;
-	g_atomic_int_set(&devc->abort, 1);
-	g_atomic_int_set(&devc->discard_queue, 1);
-	slogic_cancel_transfers(devc);
-	while ((slogic_submitted_count(devc) > 0 ||
-		slogic_active_callbacks(devc) > 0) && wait_ms++ < 2000)
-		g_usleep(1000);
-	slogic_clear_raw_queue(devc);
-	if (devc->raw_queue) {
-		g_async_queue_unref(devc->raw_queue);
-		devc->raw_queue = NULL;
-	}
-	g_free(devc->transfers);
-	devc->transfers = NULL;
-	devc->num_transfers = 0;
-	devc->submitted_transfers = 0;
+	return 0;
 }
 
 static void slogic_finish_session(struct slogic_context *devc)
@@ -1565,50 +879,13 @@ static void slogic_finish_session(struct slogic_context *devc)
 	devc->raw_pending_len = 0;
 	devc->fast_pending_len = 0;
 
-	/*
-	 * Report what the link actually delivered.  The analyzer streams a
-	 * 32ch@200MHz capture at about 800 MB/s, so this line is the quickest
-	 * way to tell "the device kept up" (stream window ~= the requested
-	 * duration) from "the device stalled and the host drained a partial
-	 * buffer".
-	 */
-	if (devc->transfers_time_data && devc->transfers_time_latest) {
-		int64_t now = g_get_monotonic_time();
-		double data_s =
-			(double)(devc->transfers_time_latest -
-				 devc->transfers_time_data) / 1e6;
-		double mb = (double)devc->transfers_received_bytes / 1e6;
-
-		/* Rate over the data window only: slogic_avg_mbps starts the clock at
-		 * the first byte, so the arm/cold-start wake-up does not drag it. */
-		sr_info("stream done: %.1f MB in %.3f s (%.0f MB/s), %.3f MSa, "
-			"cold-start %.0f ms, host tail %.0f ms",
-			mb, data_s,
-			slogic_avg_mbps(devc->transfers_received_bytes,
-					devc->transfers_time_data,
-					devc->transfers_time_latest),
-			(double)devc->num_samples / 1e6,
-			(double)(devc->transfers_time_data -
-				 devc->transfers_time_start) / 1e3,
-			(double)(now - devc->transfers_time_latest) / 1e3);
-	}
-
+	/* The core logged its "slogic-report v1" line (rate, cold start). */
 	sr_info("send SR_DF_END, samples=%" PRIu64, devc->num_samples);
 	memset(&packet, 0, sizeof(packet));
 	packet.type = SR_DF_END;
 	packet.status = SR_PKT_OK;
 	ds_data_forward(devc->sdi, &packet);
 	devc->end_sent = 1;
-
-	if (devc->raw_queue) {
-		slogic_clear_raw_queue(devc);
-		g_async_queue_unref(devc->raw_queue);
-		devc->raw_queue = NULL;
-	}
-	g_free(devc->transfers);
-	devc->transfers = NULL;
-	devc->num_transfers = 0;
-	devc->submitted_transfers = 0;
 	devc->status = SLOGIC_ST_FINISH;
 	if (devc->source_added) {
 		sr_session_source_remove(-1);
@@ -1619,70 +896,20 @@ static void slogic_finish_session(struct slogic_context *devc)
 static int receive_data(int fd, int revents, const struct sr_dev_inst *sdi)
 {
 	struct slogic_context *devc = sdi->priv;
-	GByteArray *array;
-	int n;
 
 	(void)fd;
 	(void)revents;
 
-	if (g_atomic_int_get(&devc->abort)) {
-		devc->status = SLOGIC_ST_STOP;
-		slogic_cancel_transfers(devc);
-		/* Firmware STOP is deliberately deferred until every bulk URB has
-		 * returned. Some U3 firmware reports BUSY when a control transfer
-		 * is issued from inside (or alongside) an active bulk callback. */
-		if (slogic_submitted_count(devc) == 0 &&
-		    slogic_active_callbacks(devc) == 0 &&
-		    g_atomic_int_get(&devc->fw_streaming))
-			slogic_hw_stop(devc);
-		if (g_atomic_int_get(&devc->discard_queue))
-			slogic_clear_raw_queue(devc);
-	}
-
-	/*
-	 * A control transfer must not be issued from inside a bulk callback
-	 * (some U3 firmware answers BUSY then), so the re-arm requested by
-	 * receive_transfer() is executed here, on the collect thread.
-	 */
-	if (!g_atomic_int_get(&devc->abort) &&
-	    g_atomic_int_get(&devc->restart_pending)) {
-		g_atomic_int_set(&devc->restart_pending, 0);
-		g_atomic_int_inc(&devc->start_retries);
-		if (slogic_hw_start(devc) != SR_OK) {
-			sr_err("hardware re-arm failed, ending capture");
-			g_atomic_int_set(&devc->abort, 1);
-			devc->status = SLOGIC_ST_STOP;
-			g_atomic_int_set(&devc->discard_queue, 1);
-		} else {
-			sr_warn("hardware re-armed (start retry %d)",
-				g_atomic_int_get(&devc->start_retries));
-		}
-	}
-
-	/* Convert a bounded number of packets per iteration. This keeps the UI
-	 * event loop responsive while the USB thread continues filling the queue. */
-	n = g_atomic_int_get(&devc->discard_queue) ? 0 : 2;
-	while (n-- > 0 && devc->raw_queue &&
-		   (array = g_async_queue_try_pop(devc->raw_queue)) != NULL) {
-		if (slogic_convert_push(devc, array->data, (int)array->len) != SR_OK) {
-			sr_err("format convert failed");
-			g_atomic_int_set(&devc->discard_queue, 1);
-			g_atomic_int_set(&devc->abort, 1);
-		}
-		g_byte_array_unref(array);
-	}
-
-	if (g_atomic_int_get(&devc->abort) &&
-			slogic_submitted_count(devc) == 0 &&
-			slogic_active_callbacks(devc) == 0 &&
-			(!devc->raw_queue ||
-			 g_async_queue_length(devc->raw_queue) == 0)) {
-		if (g_atomic_int_get(&devc->fw_streaming))
-			return TRUE; /* retry hardware STOP on the next tick */
-		slogic_finish_session(devc);
-		return FALSE;
-	}
-	return TRUE;
+	/* Up to 8 buffers per tick (waiting at most 2 ms for one): enough to
+	 * keep up with 800 MB/s at the session loop's tick rate while still
+	 * returning to the UI loop between batches. */
+	if (devc->cap &&
+	    slogic_capture_poll(devc->cap, 8, 2) == SLOGIC_CAP_RUNNING)
+		return TRUE;
+	slogic_capture_destroy(devc->cap);
+	devc->cap = NULL;
+	slogic_finish_session(devc);
+	return FALSE;
 }
 
 /* -------------------- driver API -------------------- */
@@ -1759,7 +986,6 @@ static GSList *hw_scan(GSList *options)
 		devc = g_try_malloc0(sizeof(*devc));
 		if (!devc)
 			break;
-		g_mutex_init(&devc->transfer_lock);
 
 		bus = libusb_get_bus_number(devlist[i]);
 		address = libusb_get_device_address(devlist[i]);
@@ -1782,7 +1008,6 @@ static GSList *hw_scan(GSList *options)
 				      "Sipeed", model->name, NULL);
 		if (!sdi) {
 			libusb_unref_device(devc->usb_dev);
-			g_mutex_clear(&devc->transfer_lock);
 			g_free(devc);
 			break;
 		}
@@ -1826,20 +1051,6 @@ static const GSList *hw_dev_mode_list(const struct sr_dev_inst *sdi)
 	return l;
 }
 
-static gpointer slogic_libusb_event_thread(gpointer user_data)
-{
-	struct slogic_context *devc = user_data;
-	struct timeval tv = { 1, 0 };
-
-	while (g_atomic_int_get(&devc->libusb_event_thread_run)) {
-		if (!devc->sr_ctx || !devc->sr_ctx->libusb_ctx)
-			break;
-		libusb_handle_events_timeout_completed(
-			devc->sr_ctx->libusb_ctx, &tv, NULL);
-	}
-	return NULL;
-}
-
 static int hw_dev_open(struct sr_dev_inst *sdi)
 {
 	struct slogic_context *devc = sdi->priv;
@@ -1848,38 +1059,14 @@ static int hw_dev_open(struct sr_dev_inst *sdi)
 	if (sdi->status == SR_ST_ACTIVE)
 		return SR_OK;
 
-	r = libusb_open(devc->usb_dev, &devc->devhdl);
-	if (r != 0) {
-		sr_err("open failed: %s", libusb_error_name(r));
-		if (r == LIBUSB_ERROR_NOT_SUPPORTED)
-			ds_set_last_error(SR_ERR_DEVICE_NO_DRIVER);
-		else
-			ds_set_last_error(SR_ERR_DEVICE_IS_EXCLUSIVE);
+	r = slogic_dev_open(devc->sr_ctx->libusb_ctx, devc->usb_dev, al_log, devc,
+			    &devc->sdev);
+	if (r != SLOGIC_OK) {
+		ds_set_last_error(r == SLOGIC_ERR_BUSY ? SR_ERR_DEVICE_IS_EXCLUSIVE
+						       : SR_ERR_DEVICE_NO_DRIVER);
 		return SR_ERR;
 	}
-
-	if (libusb_kernel_driver_active(devc->devhdl, 0) == 1)
-		libusb_detach_kernel_driver(devc->devhdl, 0);
-
-	r = libusb_claim_interface(devc->devhdl, 0);
-	if (r != 0) {
-		sr_err("claim failed: %s", libusb_error_name(r));
-		libusb_close(devc->devhdl);
-		devc->devhdl = NULL;
-		ds_set_last_error(SR_ERR_DEVICE_IS_EXCLUSIVE);
-		return SR_ERR;
-	}
-
-	g_atomic_int_set(&devc->libusb_event_thread_run, 1);
-	devc->libusb_event_thread = g_thread_new("slogic-libusb-events",
-		slogic_libusb_event_thread, devc);
-	if (!devc->libusb_event_thread) {
-		g_atomic_int_set(&devc->libusb_event_thread_run, 0);
-		libusb_release_interface(devc->devhdl, 0);
-		libusb_close(devc->devhdl);
-		devc->devhdl = NULL;
-		return SR_ERR_MALLOC;
-	}
+	devc->devhdl = slogic_dev_handle(devc->sdev);
 
 	/*
 	 * The wire format has to be transposed into LA_CROSS_DATA on the host,
@@ -1909,8 +1096,6 @@ static int hw_dev_open(struct sr_dev_inst *sdi)
 	slogic_update_usb_speed(devc);
 	slogic_map_samplerate(devc, devc->samplerate ? devc->samplerate
 						     : SR_MHZ(100));
-	if (slogic_hw_reset(devc) != SR_OK)
-		sr_warn("device reset failed (continuing)");
 
 	sdi->status = SR_ST_ACTIVE;
 	sr_info("open: name=\"%s\" speed=%s",
@@ -1922,44 +1107,19 @@ static int hw_dev_open(struct sr_dev_inst *sdi)
 static int hw_dev_close(struct sr_dev_inst *sdi)
 {
 	struct slogic_context *devc;
-	int wait_ms = 0;
 
 	if (!sdi || !sdi->priv)
 		return SR_ERR;
 
 	devc = sdi->priv;
-	if (devc->devhdl) {
-		if (devc->source_added || slogic_submitted_count(devc) > 0) {
-			g_atomic_int_set(&devc->discard_queue, 1);
-			slogic_request_acq_stop(devc, TRUE);
-			while ((slogic_submitted_count(devc) > 0 ||
-				slogic_active_callbacks(devc) > 0) && wait_ms < 2000) {
-				g_usleep(1000);
-				wait_ms++;
-			}
-		}
-		slogic_hw_stop(devc);
-		g_atomic_int_set(&devc->libusb_event_thread_run, 0);
-		libusb_interrupt_event_handler(devc->sr_ctx->libusb_ctx);
-		if (devc->libusb_event_thread) {
-			g_thread_join(devc->libusb_event_thread);
-			devc->libusb_event_thread = NULL;
-		}
-		if (devc->source_added) {
-			sr_session_source_remove(-1);
-			devc->source_added = 0;
-		}
-		slogic_clear_raw_queue(devc);
-		if (devc->raw_queue) {
-			g_async_queue_unref(devc->raw_queue);
-			devc->raw_queue = NULL;
-		}
-		g_free(devc->transfers);
-		devc->transfers = NULL;
-		devc->num_transfers = 0;
-		devc->submitted_transfers = 0;
-		libusb_release_interface(devc->devhdl, 0);
-		libusb_close(devc->devhdl);
+	if (devc->source_added) {
+		sr_session_source_remove(-1);
+		devc->source_added = 0;
+	}
+	if (devc->sdev) {
+		slogic_dev_close(devc->sdev); /* destroys a live capture first */
+		devc->sdev = NULL;
+		devc->cap = NULL;
 		devc->devhdl = NULL;
 	}
 	sdi->status = SR_ST_INACTIVE;
@@ -1986,9 +1146,6 @@ static int hw_dev_destroy(struct sr_dev_inst *sdi)
 		g_free(devc->raw_pending);
 		g_free(devc->cross_buf);
 		g_free(devc->fast_pending);
-		if (devc->raw_queue)
-			g_async_queue_unref(devc->raw_queue);
-		g_mutex_clear(&devc->transfer_lock);
 		g_free(devc);
 		sdi->priv = NULL;
 	}
@@ -2039,7 +1196,7 @@ SR_PRIV void slogic16u3_on_usb_reconnected(struct sr_dev_inst *sdi,
 	sr_info("reconnected: name=\"%s\" speed=%s max=%" PRIu64,
 		sdi->name ? sdi->name : "?",
 		slogic_speed_name(devc->usb_speed),
-		slogic_link_max_rate(devc));
+		al_link_max_rate(devc));
 }
 
 static int hw_dev_status_get(const struct sr_dev_inst *sdi,
@@ -2335,11 +1492,12 @@ static int config_list(int key, GVariant **data, const struct sr_dev_inst *sdi,
 static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 {
 	struct slogic_context *devc = sdi->priv;
+	slogic_capture_config c;
 	int ret;
 
 	(void)cb_data;
 
-	if (sdi->status != SR_ST_ACTIVE) {
+	if (sdi->status != SR_ST_ACTIVE || !devc->sdev) {
 		ds_set_last_error(SR_ERR_DEVICE_CLOSED);
 		return SR_ERR_DEVICE_CLOSED;
 	}
@@ -2347,36 +1505,22 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 	devc->sdi = sdi;
 	devc->num_samples = 0;
 	devc->num_bytes = 0;
-	g_atomic_int_set(&devc->abort, 0);
-	g_atomic_int_set(&devc->fw_streaming, 0);
 	devc->status = SLOGIC_ST_START;
-	devc->freewheel = 0;
 	devc->raw_pending_len = 0;
 	devc->fast_pending_len = 0;
 	devc->filt_have_prev = 0;
 	devc->stream_res_len = 0;
-	devc->drop_left = devc->model ? devc->model->first_drop_bytes
-				      : SLOGIC_DROP_FIRST_BYTES; /* per-model HW quirk */
-	devc->raw_received_bytes = 0;
-	devc->samples_need_bytes = 0;
-	devc->transfers = NULL;
-	devc->num_transfers = 0;
-	devc->submitted_transfers = 0;
-	g_atomic_int_set(&devc->callbacks_active, 0);
-	devc->raw_queue = NULL;
 	devc->source_added = 0;
 	devc->end_sent = 0;
-	devc->user_stop = 0;
-	g_atomic_int_set(&devc->discard_queue, 0);
-	devc->hw_stop_attempts = 0;
-	g_atomic_int_set(&devc->restart_pending, 0);
-	g_atomic_int_set(&devc->start_retries, 0);
 
 	slogic_refresh_enabled_bits(devc);
 	slogic_map_samplerate(devc, devc->samplerate);
-	if (devc->limit_samples && !devc->is_loop)
-		devc->samples_need_bytes =
-			(devc->limit_samples * (uint64_t)devc->channel_count + 7) / 8;
+
+	memset(&c, 0, sizeof(c));
+	al_config(devc, &c.dev);
+	c.limit_samples = devc->is_loop ? 0 : devc->limit_samples; /* 0 = loop */
+	c.sink.user = devc;
+	c.sink.data = al_sink_data;
 
 	sr_info("acq start: nch=%d en=%d rate=%" PRIu64 " loop=%d limit=%" PRIu64
 		" speed=%s",
@@ -2384,56 +1528,22 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 		devc->is_loop, devc->limit_samples,
 		slogic_speed_name(devc->usb_speed));
 
-	/* Stop leftover capture and drain the model-specific endpoint before
-	 * arming new URBs.  Note: do not reset the capture engine here - a
-	 * register reset would discard the pattern generator and reference
-	 * voltage configuration the user selected. */
-	slogic_drain_ep(devc);
-
-	/* reset -> configure -> run, as in the libsigrok adapter. The reset
-	 * re-establishes the sample clock for the selected channel-mode/rate
-	 * (needed e.g. for 4 ch @ 1400 MHz); slogic_configure then re-applies
-	 * channel mask, samplerate, threshold and pattern in canonical order, so
-	 * nothing the reset cleared is lost. */
-	{
-		slogic_transport t;
-		slogic_config c;
-		al_transport(devc, &t);
-		al_config(devc, &c);
-		if (slogic_reset(devc->model, &t) != SLOGIC_OK ||
-		    slogic_configure(devc->model, &t, &c) != SLOGIC_OK) {
-			sr_err("slogic reset/configure failed");
-			return SR_ERR;
-		}
+	ret = slogic_capture_start(devc->sdev, &c, &devc->cap);
+	if (ret != SLOGIC_OK) {
+		sr_err("capture start failed (%d)", ret);
+		return SR_ERR;
 	}
 
-	if ((ret = start_transfers(devc)) != SR_OK) {
-		sr_err("start_transfers failed");
-		slogic_abort_startup(devc);
-		return ret;
-	}
-
-	/* libusb is serviced by the dedicated event thread. The session source
-	 * only drains the raw queue and owns the stop/end state machine. */
+	/* The core's event thread services libusb; this source drains the
+	 * core's queue into LA_CROSS_DATA and ends the session. */
 	ret = sr_session_source_add(-1, 0, 1, receive_data, sdi);
 	if (ret != SR_OK) {
-		slogic_abort_startup(devc);
+		slogic_capture_destroy(devc->cap);
+		devc->cap = NULL;
 		return ret;
 	}
 	devc->source_added = 1;
-
 	std_session_send_df_header(sdi, LOG_PREFIX);
-	/* Mark the firmware as owned before issuing RUN so a concurrent stop
-	 * request cannot skip the deferred STOP path. */
-	g_atomic_int_set(&devc->fw_streaming, 1);
-	if ((ret = slogic_hw_start(devc)) != SR_OK) {
-		slogic_abort_startup(devc);
-		slogic_hw_stop(devc);
-		sr_session_source_remove(-1);
-		devc->source_added = 0;
-		g_atomic_int_set(&devc->fw_streaming, 0);
-		return ret;
-	}
 	return SR_OK;
 }
 
@@ -2446,8 +1556,8 @@ static int hw_dev_acquisition_stop(const struct sr_dev_inst *sdi, void *cb_data)
 		return SR_ERR;
 
 	devc = sdi->priv;
-	devc->user_stop = 1;
-	slogic_request_acq_stop(devc, TRUE);
+	if (devc->cap)
+		slogic_capture_stop(devc->cap);
 	return SR_OK;
 }
 
