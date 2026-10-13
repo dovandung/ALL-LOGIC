@@ -506,14 +506,15 @@ namespace pv
 
             if (mode == LOGIC)
             {
-#if defined(__x86_64__) || defined(_M_X64)
-                sw_depth = LogicMaxSWDepth64;
-#elif defined(__i386) || defined(_M_IX86)
+#if defined(__i386) || defined(_M_IX86)
                 int ch_num = _session->get_ch_num(SR_CHANNEL_LOGIC);
                 if (ch_num <= 0)
                     sw_depth = LogicMaxSWDepth32;
                 else
                     sw_depth = LogicMaxSWDepth32 / ch_num;
+#else
+                /* every 64-bit host (x86_64, arm64/Apple Silicon, ...) */
+                sw_depth = LogicMaxSWDepth64;
 #endif
             }
             else
