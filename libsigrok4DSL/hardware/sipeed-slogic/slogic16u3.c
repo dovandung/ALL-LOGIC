@@ -870,6 +870,48 @@ static int al_sink_data(void *user, const uint8_t *samples, size_t n,
 	return 0;
 }
 
+/* Trigger point, called by the core between the pre- and post-trigger
+ * samples: tell DSView where it is in the delivered stream. */
+static void al_sink_trigger(void *user, uint64_t index)
+{
+	struct slogic_context *devc = user;
+	struct sr_datafeed_packet packet;
+	struct ds_trigger_pos pos;
+
+	memset(&pos, 0, sizeof(pos));
+	pos.status = 1;
+	pos.real_pos = (uint32_t)index;
+	memset(&packet, 0, sizeof(packet));
+	packet.type = SR_DF_TRIGGER;
+	packet.status = SR_PKT_OK;
+	packet.payload = &pos;
+	ds_data_forward(devc->sdi, &packet);
+}
+
+/* DSView simple trigger (stage TriggerStages): per channel 'X' don't care,
+ * '0'/'1' level, 'R'/'F' edge, 'C' either edge -> core single-stage trigger.
+ * Pre-trigger depth follows the trigger position slider (percent). */
+static void al_map_trigger(struct slogic_context *devc, slogic_capture_config *c)
+{
+	int i;
+
+	if (!trigger || !trigger->trigger_en)
+		return;
+	for (i = 0; i < devc->channel_count && i < SLOGIC_MAX_CHANNELS; i++) {
+		switch (trigger->trigger0[TriggerStages][i]) {
+		case '0': c->trigger.match[i] = SLOGIC_TRIG_ZERO; break;
+		case '1': c->trigger.match[i] = SLOGIC_TRIG_ONE; break;
+		case 'R': c->trigger.match[i] = SLOGIC_TRIG_RISING; break;
+		case 'F': c->trigger.match[i] = SLOGIC_TRIG_FALLING; break;
+		case 'C': c->trigger.match[i] = SLOGIC_TRIG_EDGE; break;
+		default: break;
+		}
+	}
+	if (!slogic_trigger_spec_empty(&c->trigger) && c->limit_samples)
+		c->pretrigger_samples =
+			c->limit_samples * ds_trigger_get_pos() / 100;
+}
+
 static void slogic_finish_session(struct slogic_context *devc)
 {
 	struct sr_datafeed_packet packet;
@@ -1521,12 +1563,16 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 	c.limit_samples = devc->is_loop ? 0 : devc->limit_samples; /* 0 = loop */
 	c.sink.user = devc;
 	c.sink.data = al_sink_data;
+	c.sink.trigger = al_sink_trigger;
+	al_map_trigger(devc, &c);
 
 	sr_info("acq start: nch=%d en=%d rate=%" PRIu64 " loop=%d limit=%" PRIu64
-		" speed=%s",
+		" speed=%s trigger=%s pre=%" PRIu64,
 		devc->channel_count, devc->en_count, devc->samplerate,
 		devc->is_loop, devc->limit_samples,
-		slogic_speed_name(devc->usb_speed));
+		slogic_speed_name(devc->usb_speed),
+		slogic_trigger_spec_empty(&c.trigger) ? "off" : "on",
+		c.pretrigger_samples);
 
 	ret = slogic_capture_start(devc->sdev, &c, &devc->cap);
 	if (ret != SLOGIC_OK) {
