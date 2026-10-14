@@ -270,11 +270,19 @@ void TriggerDock::device_updated()
             _session->get_device()->get_config_bool(SR_CONF_STREAM, stream);
             sample_limits = _session->get_device()->get_sample_limit();
 
-            _adv_radioButton->setEnabled(!stream);
-            _position_spinBox->setEnabled(!stream);
-            _position_slider->setEnabled(!stream);
+            // A streaming driver that keeps its own host-side pre-trigger
+            // buffer reports SR_CONF_CAPTURE_RATIO; it gets the full range.
+            uint64_t ratio = 0;
+            bool host_pretrigger = stream &&
+                _session->get_device()->get_config_uint64(SR_CONF_CAPTURE_RATIO, ratio);
 
-            if (stream)
+            _adv_radioButton->setEnabled(!stream);
+            _position_spinBox->setEnabled(!stream || host_pretrigger);
+            _position_slider->setEnabled(!stream || host_pretrigger);
+
+            if (host_pretrigger)
+                maxRange = DS_MAX_TRIG_PERCENT;
+            else if (stream)
                 maxRange = 1;
             else if (hw_depth >= sample_limits)
                 maxRange = DS_MAX_TRIG_PERCENT;

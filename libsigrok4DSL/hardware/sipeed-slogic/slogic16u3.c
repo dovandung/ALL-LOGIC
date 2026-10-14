@@ -1322,6 +1322,11 @@ static int config_get(int id, GVariant **data, const struct sr_dev_inst *sdi,
 	case SR_CONF_STREAM:
 		*data = g_variant_new_boolean(TRUE);
 		break;
+	case SR_CONF_CAPTURE_RATIO:
+		/* The core keeps the pre-trigger samples in host memory, so the
+		 * trigger position is free (DSView enables its slider on this). */
+		*data = g_variant_new_uint64(trigger ? ds_trigger_get_pos() : 0);
+		break;
 	case SR_CONF_VTH:
 		*data = g_variant_new_double(devc->vth);
 		break;
