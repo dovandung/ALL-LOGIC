@@ -276,24 +276,28 @@ static uint64_t al_link_max_rate(const struct slogic_context *devc)
 	return slogic_link_max_rate(al_model(devc), al_nch(devc), al_link(devc));
 }
 
+/* "(10G) SLogic32U3": the link tag goes first so it survives when the UI
+ * elides a long device name. */
 static void slogic_apply_model_name(struct sr_dev_inst *sdi,
 					    const struct slogic_model *model,
 					    enum libusb_speed sp)
 {
-	char *name;
+	const char *tag;
+	slogic_link link;
 
 	if (!sdi || !model)
 		return;
-	if (model->proto == SLOGIC_PROTO_COMBO8 || sp == LIBUSB_SPEED_UNKNOWN)
-		name = g_strdup(model->name);
-	else if (sp == LIBUSB_SPEED_SUPER || sp == LIBUSB_SPEED_SUPER_PLUS)
-		name = g_strdup_printf("%s USB3.0", model->name);
-	else if (sp == LIBUSB_SPEED_HIGH)
-		name = g_strdup_printf("%s USB2.0", model->name);
-	else
-		name = g_strdup(model->name);
+	switch (sp) {
+	case LIBUSB_SPEED_SUPER_PLUS: link = SLOGIC_LINK_SUPER_PLUS; break;
+	case LIBUSB_SPEED_SUPER: link = SLOGIC_LINK_SUPER; break;
+	case LIBUSB_SPEED_HIGH: link = SLOGIC_LINK_HIGH; break;
+	case LIBUSB_SPEED_FULL: link = SLOGIC_LINK_FULL; break;
+	default: link = SLOGIC_LINK_UNKNOWN; break;
+	}
+	tag = model->proto == SLOGIC_PROTO_COMBO8 ? NULL : slogic_link_tag(link);
 	g_free(sdi->name);
-	sdi->name = name;
+	sdi->name = tag ? g_strdup_printf("(%s) %s", tag, model->name)
+			: g_strdup(model->name);
 }
 
 static void slogic_update_usb_speed(struct slogic_context *devc)
