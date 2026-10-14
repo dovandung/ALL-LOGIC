@@ -289,8 +289,11 @@ void TriggerDock::device_updated()
             else
                 maxRange = ceil(hw_depth * DS_MAX_TRIG_PERCENT / sample_limits);
             
-            _position_spinBox->setRange(MinTrigPosition, maxRange);
-            _position_slider->setRange(MinTrigPosition, maxRange);
+            // With a host-side pre-trigger buffer, 0% (capture starts at
+            // the trigger) is valid too.
+            int minRange = host_pretrigger ? 0 : MinTrigPosition;
+            _position_spinBox->setRange(minRange, maxRange);
+            _position_slider->setRange(minRange, maxRange);
 
             if (_session->get_device()->is_virtual() || stream) {
                 _simple_radioButton->setChecked(true);
