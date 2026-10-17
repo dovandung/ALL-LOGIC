@@ -366,6 +366,13 @@ int slogic_trigger_compile(slogic_trigger *t, const slogic_trigger_spec *spec,
 	 * edge trigger nothing toggled, for a level trigger every sample equals
 	 * the previous (already rejected) one on the level channels. */
 	t->edge_bcast = bcast(t->edge_all ? t->edge_all : t->lvl_mask, t->bits);
+	t->b_lvl_mask = bcast(t->lvl_mask, t->bits);
+	t->b_lvl_val = bcast(t->lvl_val, t->bits);
+	t->b_rise = bcast(t->rise, t->bits);
+	t->b_fall = bcast(t->fall, t->bits);
+	t->b_any = bcast(t->any, t->bits);
+	t->lane_hi = bcast((uint32_t)1 << (t->bits - 1), t->bits);
+	t->lane_lo = bcast((uint32_t)((1ull << (t->bits - 1)) - 1), t->bits);
 	return SLOGIC_OK;
 }
 
@@ -399,12 +406,58 @@ static inline uint32_t get_sample(const slogic_trigger *t, const uint8_t *p,
 	}
 }
 
+/* Lowest set bit index of a non-zero 64-bit value. */
+static inline unsigned ctz64(uint64_t v)
+{
+#if defined(__GNUC__) || defined(__clang__)
+	return (unsigned)__builtin_ctzll(v);
+#else
+	unsigned n = 0;
+	while (!(v & 1)) {
+		v >>= 1;
+		n++;
+	}
+	return n;
+#endif
+}
+
+static inline uint64_t ld64le(const uint8_t *p)
+{
+	uint64_t v;
+	memcpy(&v, p, 8); /* little-endian hosts, as elsewhere in this file */
+	return v;
+}
+
+/* Evaluate the trigger on every sample lane of a word at once. x holds spw
+ * samples, y the same samples each shifted by one (lane k of y is the sample
+ * before lane k of x). Returns a mask with the top bit of every matching lane
+ * set, 0 if none matches. */
+static inline uint64_t word_matches(const slogic_trigger *t, uint64_t x,
+				    uint64_t y)
+{
+	uint64_t v = ((x ^ t->b_lvl_val) & t->b_lvl_mask) |
+		     (t->b_rise & ~(~y & x)) |
+		     (t->b_fall & ~(y & ~x)) |
+		     (t->b_any & ~(y ^ x));
+	/* Top bit of each lane set iff that lane of v is non-zero (no carries
+	 * cross lanes: (v & lo) + lo < 2^w per lane). */
+	uint64_t nz = (((v & t->lane_lo) + t->lane_lo) | v) & t->lane_hi;
+	return ~nz & t->lane_hi;
+}
+
 int64_t slogic_trigger_scan(slogic_trigger *t, const uint8_t *packed, size_t len,
 			    uint64_t first)
 {
 	uint64_t n, i = first, spw;
 	unsigned w = t->bits;
 	uint64_t lane = w >= 32 ? 0xffffffffull : ((1ull << w) - 1ull);
+	/* Set once t->prev is known to be sample i-1 of this buffer; until then
+	 * the block skip (which reads the previous sample from the buffer) is
+	 * not used, since a carried-over prev need not match the bytes there. */
+	int prev_in_buf = 0;
+	/* Only try a block skip right after a quiet word: on busy data every
+	 * attempt would fail and just cost time. */
+	int quiet = 0;
 
 	n = t->nch < 8 ? (uint64_t)len * (8u / (unsigned)t->nch)
 		       : (uint64_t)len / (w / 8);
@@ -418,6 +471,7 @@ int64_t slogic_trigger_scan(slogic_trigger *t, const uint8_t *packed, size_t len
 			return (int64_t)i;
 		t->prev = s0;
 		t->have_prev = 1;
+		prev_in_buf = 1;
 		i++;
 	}
 
@@ -428,23 +482,76 @@ int64_t slogic_trigger_scan(slogic_trigger *t, const uint8_t *packed, size_t len
 		if (trig_match(t, t->prev, s))
 			return (int64_t)i;
 		t->prev = s;
+		prev_in_buf = 1;
 	}
-	/* Whole words: skip any word where the relevant bits never change. */
-	for (; i + spw <= n; i += spw) {
-		uint64_t x, y;
-		unsigned k;
-		memcpy(&x, packed + i * w / 8, 8); /* little-endian hosts */
+	/* Whole words. */
+	while (i + spw <= n) {
+		const uint8_t *p = packed + i * w / 8;
+		uint64_t x, y, m;
+
+		/* Quiet stretch: when a whole block of words has no change on the
+		 * relevant bits, skip it without looking at single words. The
+		 * previous word is read from the buffer, so this needs one word of
+		 * history before p. */
+		if (quiet && prev_in_buf && p - packed >= 8) {
+#ifdef SLOGIC_HAVE_SSE2
+			if (i + 8 * spw <= n) {
+				const __m128i eb = _mm_set1_epi64x((long long)t->edge_bcast);
+				const __m128i z = _mm_setzero_si128();
+				__m128i acc = z;
+				int q;
+				for (q = 0; q < 4; q++) {
+					__m128i cx = _mm_loadu_si128((const __m128i *)(p + 16 * q));
+					__m128i cp = _mm_loadu_si128((const __m128i *)(p + 16 * q - 8));
+					__m128i cy = _mm_or_si128(_mm_sll_epi64(cx, _mm_cvtsi32_si128((int)w)),
+								  _mm_srl_epi64(cp, _mm_cvtsi32_si128((int)(64 - w))));
+					acc = _mm_or_si128(acc, _mm_and_si128(_mm_xor_si128(cx, cy), eb));
+				}
+				if (_mm_movemask_epi8(_mm_cmpeq_epi8(acc, z)) == 0xffff) {
+					t->prev = (uint32_t)((ld64le(p + 56) >> (64 - w)) & lane);
+					i += 8 * spw;
+					continue;
+				}
+				quiet = 0;
+			}
+#else
+			if (i + 4 * spw <= n) {
+				uint64_t acc = 0;
+				int q;
+				for (q = 0; q < 4; q++) {
+					uint64_t cx = ld64le(p + 8 * q);
+					uint64_t cy = (cx << w) | (ld64le(p + 8 * q - 8) >> (64 - w));
+					acc |= (cx ^ cy) & t->edge_bcast;
+				}
+				if (!acc) {
+					t->prev = (uint32_t)((ld64le(p + 24) >> (64 - w)) & lane);
+					i += 4 * spw;
+					continue;
+				}
+				quiet = 0;
+			}
+#endif
+		}
+
+		x = ld64le(p);
 		y = (x << w) | t->prev;
+		prev_in_buf = 1;
 		if (((x ^ y) & t->edge_bcast) == 0) {
 			t->prev = (uint32_t)((x >> (64 - w)) & lane);
+			quiet = 1;
+			i += spw;
 			continue;
 		}
-		for (k = 0; k < spw; k++) {
-			uint32_t s = (uint32_t)((x >> (k * w)) & lane);
-			if (trig_match(t, t->prev, s))
-				return (int64_t)(i + k);
-			t->prev = s;
+		quiet = 0;
+		/* Something changed: test all lanes of the word together. */
+		m = word_matches(t, x, y);
+		if (m) {
+			unsigned k = ctz64(m) / w;
+			t->prev = (uint32_t)((y >> (k * w)) & lane);
+			return (int64_t)(i + k);
 		}
+		t->prev = (uint32_t)((x >> (64 - w)) & lane);
+		i += spw;
 	}
 	/* Tail. */
 	for (; i < n; i++) {

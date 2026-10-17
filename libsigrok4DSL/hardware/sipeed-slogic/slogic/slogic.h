@@ -334,6 +334,10 @@ typedef struct slogic_trigger {
 	uint32_t smask;         /* (1 << nch) - 1 */
 	uint32_t lvl_mask, lvl_val, rise, fall, any, edge_all;
 	uint64_t edge_bcast;    /* edge_all repeated in every lane of a u64 */
+	/* The conditions above repeated in every lane of a u64, plus per-lane
+	 * masks (lane_hi: top bit of each lane, lane_lo: the bits below it), so a
+	 * whole word of samples is tested at once. */
+	uint64_t b_lvl_mask, b_lvl_val, b_rise, b_fall, b_any, lane_lo, lane_hi;
 	uint32_t prev;
 	int have_prev;
 } slogic_trigger;
