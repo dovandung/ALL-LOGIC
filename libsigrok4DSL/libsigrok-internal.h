@@ -372,6 +372,12 @@ SR_PRIV int ezusb_install_firmware(libusb_device_handle *hdl,
 				   const char *filename);
 SR_PRIV int ezusb_upload_firmware(libusb_device *dev, int configuration,
 				  const char *filename);
+SR_PRIV int ezusb_fx3_ram_write(libusb_device_handle *hdl, unsigned char *buf,
+				unsigned int ramAddress, int len);
+SR_PRIV int ezusb_install_firmware_fx3(libusb_device_handle *hdl,
+				       const char *filename);
+SR_PRIV int ezusb_upload_firmware_fx3(libusb_device *dev, int configuration,
+				      const char *filename);
 
 /*--- hardware/common/usb.c -------------------------------------------------*/
 

@@ -17,8 +17,9 @@ power-up:
   **04B4:00F3** (or a second-stage boot loader as **04B4:1234** with other
   USB strings)
 - the driver writes the image over vendor request 0xA0 in 4 KB chunks,
-  reads every chunk back to check it, and jumps to the entry address
-  (`../common/fx3load.c`)
+  checks the image checksum and jumps to the entry address
+  (`ezusb_upload_firmware_fx3()` in `../common/ezusb.c`, the libsigrok
+  loader)
 - the FX3 re-enumerates as **04B4:1234** with the strings `sigrok` /
   `cypress-fx3` and shows up in the device list as **Cypress FX3**
 

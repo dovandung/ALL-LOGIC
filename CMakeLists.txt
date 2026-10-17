@@ -501,7 +501,6 @@ set(libsigrok4DSL_SOURCES
     libsigrok4DSL/hardware/common/usb.c
     libsigrok4DSL/hardware/common/ezusb.c
     libsigrok4DSL/hardware/common/capture_core.c
-    libsigrok4DSL/hardware/common/fx3load.c
     libsigrok4DSL/hardware/cypress-fx3/cypress_fx3.c
     libsigrok4DSL/trigger.c
     libsigrok4DSL/dsdevice.c

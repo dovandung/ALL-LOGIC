@@ -25,7 +25,8 @@
  *
  * Port of the libsigrok cypress-fx3-8 driver. The firmware
  * (DSView/res/cypress-fx3-8.fw) is loaded into the FX3's RAM through its
- * USB boot loader; it then enumerates as 04B4:1234 with the strings
+ * USB boot loader with ezusb_upload_firmware_fx3() (../common/ezusb.c, as
+ * in libsigrok); it then enumerates as 04B4:1234 with the strings
  * "sigrok" / "cypress-fx3". Commands (vendor requests):
  *   0xB0 GET_FW_VERSION  -> { major, minor }, major must be 1
  *   0xB2 GET_REVID       -> 1 byte
@@ -46,12 +47,12 @@
 #include "../../libsigrok-internal.h"
 #include "../../log.h"
 #include "../common/capture_core.h"
-#include "../common/fx3load.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cypress-fx3: "
 
 #define USB_INTERFACE		0
+#define USB_CONFIGURATION	1
 #define FX3_EP_IN		(2 | LIBUSB_ENDPOINT_IN)
 
 #define CMD_GET_FW_VERSION	0xb0
@@ -671,7 +672,7 @@ static GSList *hw_scan(GSList *options)
 				sr_err("Firmware directory not set.");
 				continue;
 			}
-			ret = fx3_upload_firmware(dev, path);
+			ret = ezusb_upload_firmware_fx3(dev, USB_CONFIGURATION, path);
 			g_free(path);
 			if (ret != SR_OK) {
 				sr_err("Firmware upload to %04x:%04x failed.",
