@@ -19,15 +19,21 @@
  */
 
 /*
- * 8 channel logic analyzer on a Cypress (Infineon) FX3: the FX3's GPIF
- * samples 8 inputs at up to 200 MHz (PIB clock 400 MHz / integer factor)
- * and streams them over USB 3 bulk endpoint 0x82, one byte per sample.
+ * Logic analyzer on a Cypress (Infineon) FX3: the FX3's GPIF samples its
+ * inputs (PIB clock 400 MHz / integer factor) and streams them over USB 3
+ * bulk endpoint 0x82. Two firmwares, chosen with the channel mode:
+ *   8 channels,  1 byte per sample,  up to 200 MHz (cypress-fx3-8.fw)
+ *   16 channels, 2 bytes per sample, up to 100 MHz (cypress-fx3-16.fw)
  *
- * Port of the libsigrok cypress-fx3-8 driver. The firmware
- * (DSView/res/cypress-fx3-8.fw) is loaded into the FX3's RAM through its
- * USB boot loader with ezusb_upload_firmware_fx3() (../common/ezusb.c, as
- * in libsigrok); it then enumerates as 04B4:1234 with the strings
- * "sigrok" / "cypress-fx3". Commands (vendor requests):
+ * Port of the libsigrok cypress-fx3-8 and cypress-fx3 (16 bit) drivers.
+ * The firmware (DSView/res) is loaded into the FX3's RAM through its USB
+ * boot loader with ezusb_upload_firmware_fx3() (../common/ezusb.c, as in
+ * libsigrok); both then enumerate as 04B4:1234 with the strings
+ * "sigrok" / "cypress-fx3", so which one runs cannot be read from the
+ * device: the driver records the firmware it loaded (in the user's config
+ * directory, so it survives a restart of ALL LOGIC). Neither firmware can
+ * be told to go back to the boot loader, so a different channel mode takes
+ * effect when the FX3 is plugged in again. Commands (vendor requests):
  *   0xB0 GET_FW_VERSION  -> { major, minor }, major must be 1
  *   0xB2 GET_REVID       -> 1 byte
  *   0xB1 START           <- u16 sampling factor = 400 MHz / sample rate
@@ -62,10 +68,7 @@
 #define CMD_TIMEOUT_MS		100
 
 #define FX3_PIB_CLOCK		SR_MHZ(400)
-#define MAX_SAMPLE_RATE		SR_MHZ(200)
-#define NUM_CHANNELS		8
-
-#define NUM_SIMUL_TRANSFERS	64
+#define NUM_CHANNELS		16	/* the most any mode has */
 /* the libsigrok driver ends the capture at the second empty/failed
  * transfer in a row: the FX3 has stopped */
 #define MAX_EMPTY_TRANSFERS	1
@@ -81,25 +84,58 @@
 #define SEND_CHUNK		(1024 * 1024)
 
 #define FX3_VID			0x04b4
-#define FX3_PID_FW		0x1234	/* running cypress-fx3-8 firmware */
+#define FX3_PID_FW		0x1234	/* running firmware (either mode) */
 #define FX3_PID_BOOT		0x00f3	/* FX3 ROM boot loader */
-#define FX3_FIRMWARE		"cypress-fx3-8.fw"
 
-static const uint64_t samplerates[] = {
+static const uint64_t samplerates_8[] = {
 	SR_KHZ(500), SR_MHZ(1), SR_MHZ(5), SR_MHZ(10), SR_MHZ(25),
 	SR_MHZ(50), SR_MHZ(100), SR_MHZ(200),
+};
+
+static const uint64_t samplerates_16[] = {
+	SR_KHZ(500), SR_MHZ(1), SR_MHZ(5), SR_MHZ(10), SR_MHZ(25),
+	SR_MHZ(50), SR_MHZ(100),
+};
+
+/* One per firmware; transfer sizing as in the respective libsigrok driver. */
+struct fx3_mode {
+	const char *firmware;
+	int channels;
+	unsigned int unit;		/* bytes per sample */
+	const uint64_t *rates;
+	unsigned int num_rates;
+	unsigned int buf_ms;		/* transfer size: buf_ms * rate / 1000 bytes */
+	unsigned int max_transfers;
+	unsigned int headroom_div;	/* timeout = t + t / headroom_div */
+};
+
+enum { FX3_MODE_8CH = 0, FX3_MODE_16CH = 1, FX3_NUM_MODES };
+
+static const struct fx3_mode modes[FX3_NUM_MODES] = {
+	{ "cypress-fx3-8.fw",  8, 1, samplerates_8,  G_N_ELEMENTS(samplerates_8),
+	  10, 64, 2 },
+	{ "cypress-fx3-16.fw", 16, 2, samplerates_16, G_N_ELEMENTS(samplerates_16),
+	  20, 32, 4 },
+};
+
+static const struct sr_list_item channel_mode_list[] = {
+	{ FX3_MODE_8CH, "Use Channels 0~7 (Max 200MHz)" },
+	{ FX3_MODE_16CH, "Use Channels 0~15 (Max 100MHz)" },
+	{ -1, NULL },
 };
 
 static const char *maxHeights[] = { "1X", "2X", "3X", "4X", "5X" };
 
 static const int32_t hwoptions[] = {
 	SR_CONF_OPERATION_MODE,
+	SR_CONF_CHANNEL_MODE,
 	SR_CONF_MAX_HEIGHT,
 };
 
 static const int32_t sessions[] = {
 	SR_CONF_MAX_HEIGHT,
 	SR_CONF_OPERATION_MODE,
+	SR_CONF_CHANNEL_MODE,
 	SR_CONF_SAMPLERATE,
 	SR_CONF_LIMIT_SAMPLES,
 };
@@ -118,6 +154,10 @@ struct fx3_context {
 	uint64_t samplerate;
 	uint64_t limit_samples;
 	int max_height;
+
+	int ch_mode;			/* chosen mode: firmware to load next time */
+	int fw_mode;			/* mode of the firmware running now */
+	gboolean fw_mode_known;		/* FALSE: running firmware assumed */
 
 	/*
 	 * USB completions run wherever libusb events are handled (the session
@@ -144,11 +184,117 @@ static struct sr_dev_driver *di = &cypress_fx3_driver_info;
 
 /* ------------------------------------------------------------ helpers */
 
-static char *fw_path(void)
+static char *fw_path(int mode)
 {
 	if (DS_RES_PATH[0] == '\0')
 		return NULL;
-	return g_build_filename(DS_RES_PATH, FX3_FIRMWARE, NULL);
+	return g_build_filename(DS_RES_PATH, modes[mode].firmware, NULL);
+}
+
+static const struct fx3_mode *cur_mode(const struct fx3_context *devc)
+{
+	return &modes[devc->fw_mode];
+}
+
+/* ------------------------------------------------------------ settings */
+
+/*
+ * <user config dir>/AllLogic/cypress-fx3.ini:
+ *   channel_mode     the mode chosen in the device options (firmware to load)
+ *   loaded_firmware  the mode of the firmware loaded last (-1: none yet)
+ * Both firmwares look the same on USB, so the second one is how a running
+ * FX3's mode is known, also after ALL LOGIC is restarted.
+ */
+static char *settings_path(void)
+{
+	return g_build_filename(g_get_user_config_dir(), "AllLogic",
+				"cypress-fx3.ini", NULL);
+}
+
+static int settings_get(const char *key, int def)
+{
+	char *path = settings_path();
+	GKeyFile *kf = g_key_file_new();
+	GError *err = NULL;
+	int v = def;
+
+	if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
+		v = g_key_file_get_integer(kf, "cypress-fx3", key, &err);
+		if (err) {
+			v = def;
+			g_clear_error(&err);
+		}
+	}
+	g_key_file_free(kf);
+	g_free(path);
+	return v;
+}
+
+static void settings_set(const char *key, int value)
+{
+	char *path = settings_path();
+	char *dir = g_path_get_dirname(path);
+	GKeyFile *kf = g_key_file_new();
+	GError *err = NULL;
+
+	g_key_file_load_from_file(kf, path, G_KEY_FILE_KEEP_COMMENTS, NULL);
+	g_key_file_set_integer(kf, "cypress-fx3", key, value);
+	g_mkdir_with_parents(dir, 0755);
+	if (!g_key_file_save_to_file(kf, path, &err)) {
+		sr_warn("Cannot save %s: %s", path, err ? err->message : "?");
+		g_clear_error(&err);
+	}
+	g_key_file_free(kf);
+	g_free(dir);
+	g_free(path);
+}
+
+static int valid_mode(int m)
+{
+	return m >= 0 && m < FX3_NUM_MODES;
+}
+
+static int chosen_mode(void)
+{
+	int m = settings_get("channel_mode", FX3_MODE_8CH);
+	return valid_mode(m) ? m : FX3_MODE_8CH;
+}
+
+static int loaded_mode(void)
+{
+	int m = settings_get("loaded_firmware", -1);
+	return valid_mode(m) ? m : -1;
+}
+
+/* nearest offered rate of the running firmware (the rate lists differ) */
+static void clamp_samplerate(struct fx3_context *devc)
+{
+	const struct fx3_mode *m = cur_mode(devc);
+	uint64_t best = m->rates[0], d, bd = UINT64_MAX;
+	unsigned int i;
+
+	for (i = 0; i < m->num_rates; i++) {
+		d = m->rates[i] > devc->samplerate ? m->rates[i] - devc->samplerate
+						   : devc->samplerate - m->rates[i];
+		if (d < bd) {
+			bd = d;
+			best = m->rates[i];
+		}
+	}
+	devc->samplerate = best;
+}
+
+/* channels beyond the running firmware's are off */
+static void apply_channel_count(struct sr_dev_inst *sdi)
+{
+	struct fx3_context *devc = sdi->priv;
+	GSList *l;
+
+	for (l = sdi->channels; l; l = l->next) {
+		struct sr_channel *ch = l->data;
+		if (ch->type == SR_CHANNEL_LOGIC)
+			ch->enabled = ch->index < cur_mode(devc)->channels;
+	}
 }
 
 /* The firmware runs if the device says "sigrok" / "cypress-fx3". */
@@ -215,18 +361,19 @@ static libusb_device *wait_for_firmware(struct sr_context *sr_ctx)
 
 static void refresh_enabled(struct fx3_context *devc, const struct sr_dev_inst *sdi)
 {
+	int nch = cur_mode(devc)->channels;
 	GSList *l;
 	int n = 0;
 
 	for (l = sdi->channels; l; l = l->next) {
 		struct sr_channel *ch = l->data;
 		if (ch->type != SR_CHANNEL_LOGIC || !ch->enabled ||
-		    ch->index >= NUM_CHANNELS)
+		    ch->index >= nch)
 			continue;
 		devc->en_bits[n++] = (uint8_t)ch->index;
 	}
 	if (n == 0)
-		for (n = 0; n < NUM_CHANNELS; n++)
+		for (n = 0; n < nch; n++)
 			devc->en_bits[n] = (uint8_t)n;
 	devc->en_count = n;
 }
@@ -235,6 +382,7 @@ static void refresh_enabled(struct fx3_context *devc, const struct sr_dev_inst *
  * '0'/'1' level, 'R'/'F' edge, 'C' either edge; disabled channels ignored. */
 static void map_trigger(const struct sr_dev_inst *sdi, struct hl_trigger_spec *t)
 {
+	const struct fx3_context *devc = sdi->priv;
 	GSList *l;
 
 	memset(t, 0, sizeof(*t));
@@ -242,12 +390,12 @@ static void map_trigger(const struct sr_dev_inst *sdi, struct hl_trigger_spec *t
 		return;
 	for (l = sdi->channels; l; l = l->next) {
 		struct sr_channel *ch = l->data;
-		uint8_t m;
+		uint16_t m;
 
 		if (ch->type != SR_CHANNEL_LOGIC || !ch->enabled ||
-		    ch->index >= NUM_CHANNELS)
+		    ch->index >= cur_mode(devc)->channels)
 			continue;
-		m = (uint8_t)(1u << ch->index);
+		m = (uint16_t)(1u << ch->index);
 		switch (trigger->trigger0[TriggerStages][ch->index]) {
 		case '0': t->must_zero |= m; break;
 		case '1': t->must_one |= m; break;
@@ -300,7 +448,8 @@ static int command_start_acquisition(struct fx3_context *devc)
 	uint64_t factor;
 	int ret;
 
-	if (devc->samplerate == 0 || devc->samplerate > MAX_SAMPLE_RATE) {
+	if (devc->samplerate == 0 ||
+	    devc->samplerate > cur_mode(devc)->rates[cur_mode(devc)->num_rates - 1]) {
 		sr_err("Unable to sample at %" PRIu64 " Hz.", devc->samplerate);
 		return SR_ERR;
 	}
@@ -318,8 +467,8 @@ static int command_start_acquisition(struct fx3_context *devc)
 		       libusb_error_name(ret));
 		return SR_ERR;
 	}
-	sr_info("START: %" PRIu64 " Hz (sampling factor %u).", devc->samplerate,
-		(unsigned int)factor);
+	sr_info("START: %d channels, %" PRIu64 " Hz (sampling factor %u).",
+		cur_mode(devc)->channels, devc->samplerate, (unsigned int)factor);
 	return SR_OK;
 }
 
@@ -331,22 +480,26 @@ static unsigned int bytes_per_ms(const struct fx3_context *devc)
 	return b ? b : 1;
 }
 
-/* Each transfer holds about 10 ms of data, a multiple of 1024 bytes. */
+/*
+ * As in the libsigrok drivers (where "bytes per ms" is rate / 1000 also
+ * for 16-bit samples): each transfer is buf_ms * rate / 1000 bytes, a
+ * multiple of 1024, i.e. 10 ms of data in both modes, and together they
+ * hold 500 * rate / 1000 bytes, at most max_transfers of them.
+ */
 static size_t get_buffer_size(const struct fx3_context *devc)
 {
-	size_t s = 10 * (size_t)bytes_per_ms(devc);
+	size_t s = cur_mode(devc)->buf_ms * (size_t)bytes_per_ms(devc);
 	return (s + 1023) & ~(size_t)1023;
 }
 
-/* All transfers together hold about 500 ms of data. */
 static unsigned int get_number_of_transfers(const struct fx3_context *devc)
 {
 	unsigned int n = (unsigned int)(500 * (size_t)bytes_per_ms(devc) /
 					get_buffer_size(devc));
 	if (n < 2)
 		n = 2;
-	if (n > NUM_SIMUL_TRANSFERS)
-		n = NUM_SIMUL_TRANSFERS;
+	if (n > cur_mode(devc)->max_transfers)
+		n = cur_mode(devc)->max_transfers;
 	return n;
 }
 
@@ -354,7 +507,7 @@ static unsigned int get_timeout(const struct fx3_context *devc)
 {
 	size_t total = get_buffer_size(devc) * get_number_of_transfers(devc);
 	unsigned int t = (unsigned int)(total / bytes_per_ms(devc));
-	return t + t / 2;	/* 50 % headroom */
+	return t + t / cur_mode(devc)->headroom_div;	/* 50 % / 25 % headroom */
 }
 
 /* Called with the mutex held. */
@@ -493,6 +646,7 @@ static int start_transfers(struct fx3_context *devc)
 
 /* ------------------------------------------------------- send to session */
 
+/* n samples from src (cur_mode(devc)->unit bytes each) */
 static void send_cross(struct fx3_context *devc, const uint8_t *src, uint64_t n)
 {
 	struct sr_datafeed_packet packet;
@@ -501,7 +655,8 @@ static void send_cross(struct fx3_context *devc, const uint8_t *src, uint64_t n)
 	while (n) {
 		uint64_t k = n < SEND_CHUNK ? n : SEND_CHUNK;
 
-		hl_to_cross(src, k, devc->en_bits, devc->en_count, devc->cross_buf);
+		hl_to_cross(src, k, devc->en_bits, devc->en_count, devc->cross_buf,
+			    cur_mode(devc)->unit);
 		memset(&packet, 0, sizeof(packet));
 		memset(&logic, 0, sizeof(logic));
 		packet.type = SR_DF_LOGIC;
@@ -511,7 +666,7 @@ static void send_cross(struct fx3_context *devc, const uint8_t *src, uint64_t n)
 		logic.format = LA_CROSS_DATA;
 		logic.data = devc->cross_buf;
 		ds_data_forward(devc->sdi, &packet);
-		src += k;
+		src += k * cur_mode(devc)->unit;
 		n -= k;
 	}
 }
@@ -550,7 +705,7 @@ static void send_capture(struct fx3_context *devc, gboolean complete)
 	send_cross(devc, c->buf, pre);
 	if (c->have_trigger)
 		send_trigger(devc, c->trigger_pos);
-	send_cross(devc, c->buf + pre, total - pre);
+	send_cross(devc, c->buf + pre * c->unit, total - pre);
 }
 
 /* All transfers are back: send the data and SR_DF_END. */
@@ -650,28 +805,46 @@ static GSList *hw_scan(GSList *options)
 		struct sr_usb_dev_inst *usb_info;
 		libusb_device *dev = devlist[i], *live = NULL;
 		char name[16];
-		int ch;
+		int ch, fw_mode;
+		gboolean fw_known;
 
 		if (libusb_get_device_descriptor(dev, &des) != 0 || !is_fx3(&des))
 			continue;
 		if (sr_usb_device_is_exists(dev))
 			continue;
 
-		if (!has_running_fw(dev)) {
+		fw_mode = chosen_mode();
+		fw_known = TRUE;
+		if (has_running_fw(dev)) {
+			/* both firmwares look alike: use what we loaded */
+			int lm = loaded_mode();
+			if (lm >= 0) {
+				fw_mode = lm;
+			} else {
+				fw_known = FALSE;
+				sr_warn("An FX3 already runs a firmware not loaded by "
+					"ALL LOGIC; assuming the %d channel one. Plug it "
+					"in again to load the chosen firmware.",
+					modes[fw_mode].channels);
+			}
+		} else {
 			char *path;
 			int ret;
 
-			/* one upload at a time; give the FX3 time to come back */
+			/* an FX3 that has not come back from an upload yet may
+			 * still show up as the boot loader: do not upload again */
 			if (last_upload && g_get_monotonic_time() - last_upload <
 					   5 * G_TIME_SPAN_SECOND) {
 				sr_info("Waiting for an FX3 to re-enumerate, not uploading again.");
 				continue;
 			}
-			path = fw_path();
+			path = fw_path(fw_mode);
 			if (!path) {
 				sr_err("Firmware directory not set.");
 				continue;
 			}
+			sr_info("Loading the %d channel firmware (%s).",
+				modes[fw_mode].channels, modes[fw_mode].firmware);
 			ret = ezusb_upload_firmware_fx3(dev, USB_CONFIGURATION, path);
 			g_free(path);
 			if (ret != SR_OK) {
@@ -679,12 +852,16 @@ static GSList *hw_scan(GSList *options)
 				       des.idVendor, des.idProduct);
 				continue;
 			}
+			settings_set("loaded_firmware", fw_mode);
 			last_upload = g_get_monotonic_time();
 			live = wait_for_firmware(drvc->sr_ctx);
 			if (!live) {
 				sr_err("The FX3 did not come back after the firmware upload.");
 				continue;
 			}
+			/* back with its firmware: a boot loader seen from now on is
+			 * a new plug-in, not this upload still in progress */
+			last_upload = 0;
 			dev = live;
 		}
 
@@ -701,6 +878,9 @@ static GSList *hw_scan(GSList *options)
 		devc->limit_samples = DEFAULT_SAMPLES;
 		devc->max_height = 1;
 		devc->cap.state = HL_IDLE;
+		devc->ch_mode = chosen_mode();
+		devc->fw_mode = fw_mode;
+		devc->fw_mode_known = fw_known;
 
 		sdi = sr_dev_inst_new(LOGIC, SR_ST_INACTIVE, "Cypress", "FX3",
 				      "cypress-fx3");
@@ -726,7 +906,9 @@ static GSList *hw_scan(GSList *options)
 			sdi->channels = g_slist_append(sdi->channels,
 				sr_channel_new(ch, SR_CHANNEL_LOGIC, TRUE, name));
 		}
-		sr_info("Found a Cypress FX3 with the cypress-fx3-8 firmware on %d.%d.",
+		apply_channel_count(sdi);
+		sr_info("Found a Cypress FX3 with the %d channel firmware%s on %d.%d.",
+			modes[fw_mode].channels, fw_known ? "" : " (assumed)",
 			libusb_get_bus_number(devc->usb_dev),
 			libusb_get_device_address(devc->usb_dev));
 		devices = g_slist_append(devices, sdi);
@@ -784,7 +966,10 @@ static int hw_dev_open(struct sr_dev_inst *sdi)
 
 	devc->sdi = sdi;
 	sdi->status = SR_ST_ACTIVE;
-	sr_info("Opened, firmware %d.%d, REVID 0x%02x.", major, minor, revid);
+	clamp_samplerate(devc);
+	sr_info("Opened, firmware %d.%d (%d channels%s), REVID 0x%02x.", major,
+		minor, cur_mode(devc)->channels,
+		devc->fw_mode_known ? "" : ", assumed", revid);
 	return SR_OK;
 
 fail:
@@ -883,8 +1068,15 @@ static int config_get(int id, GVariant **data, const struct sr_dev_inst *sdi,
 		*data = g_variant_new_uint64(MAX_SAMPLES);
 		break;
 	case SR_CONF_TOTAL_CH_NUM:
-	case SR_CONF_VLD_CH_NUM:
 		*data = g_variant_new_int16(NUM_CHANNELS);
+		break;
+	case SR_CONF_VLD_CH_NUM:
+		/* what the running firmware samples */
+		*data = g_variant_new_int16(cur_mode(devc)->channels);
+		break;
+	case SR_CONF_CHANNEL_MODE:
+		/* the chosen mode (loaded at the next plug-in if different) */
+		*data = g_variant_new_int16(devc->ch_mode);
 		break;
 	case SR_CONF_STREAM:
 		*data = g_variant_new_boolean(TRUE);
@@ -928,13 +1120,37 @@ static int config_set(int id, GVariant *data, struct sr_dev_inst *sdi,
 		break;
 	case SR_CONF_SAMPLERATE:
 		v = g_variant_get_uint64(data);
-		for (i = 0; i < G_N_ELEMENTS(samplerates); i++)
-			if (samplerates[i] == v)
+		for (i = 0; i < cur_mode(devc)->num_rates; i++)
+			if (cur_mode(devc)->rates[i] == v)
 				break;
-		if (i == G_N_ELEMENTS(samplerates))
+		if (i == cur_mode(devc)->num_rates)
 			return SR_ERR_ARG;
 		devc->samplerate = v;
 		break;
+	case SR_CONF_CHANNEL_MODE: {
+		int nv = g_variant_get_int16(data);
+
+		if (!valid_mode(nv))
+			return SR_ERR_ARG;
+		devc->ch_mode = nv;
+		settings_set("channel_mode", nv);
+		if (nv != devc->fw_mode || !devc->fw_mode_known) {
+			/*
+			 * The running firmware cannot be swapped without
+			 * re-plugging (it has no command to go back to the boot
+			 * loader). The device options dialog shows "Please
+			 * reconnect the device!" on this error; until then the
+			 * captures use the firmware that runs.
+			 */
+			sr_info("Channel mode %d channels chosen; plug the FX3 in "
+				"again to load %s.", modes[nv].channels,
+				modes[nv].firmware);
+			ds_set_last_error(SR_ERR_DEVICE_FIRMWARE_VERSION_LOW);
+		} else {
+			ds_set_last_error(SR_OK);
+		}
+		break;
+	}
 	case SR_CONF_LIMIT_SAMPLES:
 		v = g_variant_get_uint64(data);
 		if (!v)
@@ -980,7 +1196,6 @@ static int config_list(int key, GVariant **data, const struct sr_dev_inst *sdi,
 	GVariantBuilder gvb;
 	GVariant *gvar;
 
-	(void)sdi;
 	(void)cg;
 	switch (key) {
 	case SR_CONF_DEVICE_OPTIONS:
@@ -993,8 +1208,12 @@ static int config_list(int key, GVariant **data, const struct sr_dev_inst *sdi,
 		break;
 	case SR_CONF_SAMPLERATE:
 		g_variant_builder_init(&gvb, G_VARIANT_TYPE("a{sv}"));
-		gvar = g_variant_new_fixed_array(G_VARIANT_TYPE("t"), samplerates,
-			G_N_ELEMENTS(samplerates), sizeof(uint64_t));
+		{
+			const struct fx3_mode *m = (sdi && sdi->priv) ?
+				cur_mode(sdi->priv) : &modes[FX3_MODE_8CH];
+			gvar = g_variant_new_fixed_array(G_VARIANT_TYPE("t"),
+				m->rates, m->num_rates, sizeof(uint64_t));
+		}
 		g_variant_builder_add(&gvb, "{sv}", "samplerates", gvar);
 		*data = g_variant_builder_end(&gvb);
 		break;
@@ -1003,6 +1222,9 @@ static int config_list(int key, GVariant **data, const struct sr_dev_inst *sdi,
 		break;
 	case SR_CONF_OPERATION_MODE:
 		*data = g_variant_new_uint64((uint64_t)(uintptr_t)&opmode_list);
+		break;
+	case SR_CONF_CHANNEL_MODE:
+		*data = g_variant_new_uint64((uint64_t)(uintptr_t)&channel_mode_list);
 		break;
 	default:
 		return SR_ERR_ARG;
@@ -1024,8 +1246,13 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 	}
 
 	devc->sdi = sdi;
+	clamp_samplerate(devc);
 	refresh_enabled(devc, sdi);
 	map_trigger(sdi, &spec);
+	if (devc->ch_mode != devc->fw_mode)
+		sr_warn("The %d channel firmware runs (the %d channel one is chosen; "
+			"plug the FX3 in again to load it).",
+			cur_mode(devc)->channels, modes[devc->ch_mode].channels);
 
 	/* LA_CROSS_DATA carries whole groups of 64 samples */
 	total = devc->limit_samples / 64 * 64;
@@ -1042,7 +1269,7 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 	}
 
 	devc->cross_buf = g_try_malloc(SEND_CHUNK / 64 * 8 * NUM_CHANNELS);
-	if (!devc->cross_buf || hl_alloc(&devc->cap, pre, post) != 0) {
+	if (!devc->cross_buf || hl_alloc(&devc->cap, pre, post, cur_mode(devc)->unit) != 0) {
 		sr_err("Not enough memory for %" PRIu64 " samples.", total);
 		g_free(devc->cross_buf);
 		devc->cross_buf = NULL;

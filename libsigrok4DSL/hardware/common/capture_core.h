@@ -22,8 +22,9 @@
  * the host (hsdaoh-la, cypress-fx3): trigger search, pre-trigger history,
  * capture buffer, lost-data handling (from the libsigrok hsdaoh-la driver's
  * protocol.c) and the conversion to DSView's LA_CROSS_DATA layout. Up to 8
- * channels, 1 byte per sample. No dependency on DSView or a device library,
- * so it can be tested on its own.
+ * channels with 1 byte per sample, or up to 16 with 2 bytes per sample
+ * (little endian, bit k = channel k). No dependency on DSView or a device
+ * library, so it can be tested on its own.
  *
  * Acquisition model:
  *   - the stream is scanned on the PC for the trigger condition
@@ -41,7 +42,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define HL_NUM_CHANNELS 8
+#define HL_MAX_CHANNELS 16
 
 enum hl_state {
 	HL_IDLE,	/* no acquisition running */
@@ -53,39 +54,45 @@ enum hl_state {
 
 /* Per-channel trigger condition masks (bit n = channel n), all ANDed. */
 struct hl_trigger_spec {
-	uint8_t must_zero, must_one, rising, falling, edge;
+	uint16_t must_zero, must_one, rising, falling, edge;
 };
 
 struct hl_capture {
-	/* trigger: tbl[(prev << 8) | cur] != 0 where the condition is met */
+	/* trigger: tbl[(prev << 8) | cur] != 0 where the conditions on
+	 * channels 0..7 are met; trig_tbl_hi the same for channels 8..15
+	 * (NULL when none of them is used) */
 	int have_trigger;
 	uint8_t *trig_tbl;
+	uint8_t *trig_tbl_hi;
+	unsigned int unit;	/* bytes per sample: 1 or 2 */
 
 	int state;
 	uint64_t pre;		/* samples before the trigger */
 	uint64_t post;		/* samples from the trigger on */
-	uint8_t *buf;		/* pre + post samples, 1 byte each */
+	uint8_t *buf;		/* pre + post samples, `unit` bytes each */
 	uint64_t buf_fill;
 	uint64_t trigger_pos;	/* index of the trigger sample in buf */
 	uint8_t *hist;		/* pre-trigger ring buffer */
 	uint64_t hist_pos, hist_len;
 	int have_prev;
-	uint8_t prev;
+	uint16_t prev;
 	uint64_t next_cnt;	/* expected stream word counter */
 	int cnt_valid;
 	uint64_t gaps;		/* lost-data events during this acquisition */
 	uint64_t gap_words;	/* words lost in the last event (for logging) */
 	uint8_t *unpack;	/* scratch for one unpacked buffer */
 	size_t unpack_size;
+	uint8_t carry[2];	/* half a 16-bit sample left by a transfer */
+	int carry_len;
 };
 
 /* Build the trigger lookup table. Returns 0 (no trigger needed), 1 (trigger
  * armed) or -1 (out of memory). */
 int hl_build_trigger(struct hl_capture *c, const struct hl_trigger_spec *t);
 
-/* Allocate the capture and history buffers for pre + post samples.
- * Returns 0 or -1 (out of memory). */
-int hl_alloc(struct hl_capture *c, uint64_t pre, uint64_t post);
+/* Allocate the capture and history buffers for pre + post samples of
+ * `unit` (1 or 2) bytes. Returns 0 or -1 (out of memory). */
+int hl_alloc(struct hl_capture *c, uint64_t pre, uint64_t post, unsigned int unit);
 void hl_free_buffers(struct hl_capture *c);
 void hl_free(struct hl_capture *c);
 
@@ -100,25 +107,26 @@ void hl_invalidate_counter(struct hl_capture *c);
  * the device's count of words sent before this buffer. Only acts while the
  * state is HL_ARMED or HL_CAPTURING. Returns 1 when data was lost before
  * this buffer (gaps / gap_words tell how much), 0 otherwise, -1 if out of
- * memory (the state is then HL_FAILED).
+ * memory (the state is then HL_FAILED). 1-byte samples only.
  */
 int hl_feed(struct hl_capture *c, const uint8_t *buf, size_t words,
 	    uint64_t data_cnt);
 
 /*
- * Feed n samples, 1 byte each (bit k = channel k), in stream order, from a
- * device without a stream counter (lost data cannot be detected). Only acts
+ * Feed nbytes of samples (`unit` bytes each, bit k = channel k) in stream
+ * order, from a device without a stream counter (lost data cannot be
+ * detected). A 16-bit sample split between two calls is joined. Only acts
  * while the state is HL_ARMED or HL_CAPTURING.
  */
-void hl_feed_bytes(struct hl_capture *c, const uint8_t *s, size_t n);
+void hl_feed_bytes(struct hl_capture *c, const uint8_t *s, size_t nbytes);
 
 /*
- * Convert n samples (n a multiple of 64; 1 byte per sample, bit k = channel
- * k) to LA_CROSS_DATA: for every group of 64 samples, one little-endian
- * 64-bit plane per enabled channel (bit i = sample i of the group), in the
- * order of en_bits. Writes n / 64 * 8 * en_count bytes.
+ * Convert n samples (n a multiple of 64; `unit` bytes per sample, bit k =
+ * channel k) to LA_CROSS_DATA: for every group of 64 samples, one
+ * little-endian 64-bit plane per enabled channel (bit i = sample i of the
+ * group), in the order of en_bits. Writes n / 64 * 8 * en_count bytes.
  */
 void hl_to_cross(const uint8_t *src, uint64_t n, const uint8_t *en_bits,
-		 int en_count, uint8_t *out);
+		 int en_count, uint8_t *out, unsigned int unit);
 
 #endif

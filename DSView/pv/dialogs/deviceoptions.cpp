@@ -546,7 +546,17 @@ void DeviceOptions::channel_check()
         }
     }
     assert(mode_index >= 0);
+    ds_reset_last_error();
     _device_agent->set_config_int16(SR_CONF_CHANNEL_MODE, mode_index);
+
+    // A driver that has to load other firmware for this mode (and cannot do
+    // it while the device stays plugged in) reports it like a firmware that
+    // needs a reconnect.
+    if (ds_get_last_error() == SR_ERR_DEVICE_FIRMWARE_VERSION_LOW){
+        QString strMsg = L_S(STR_PAGE_MSG, S_ID(IDS_MSG_TO_RECONNECT_FOR_FIRMWARE),
+                             "Please reconnect the device!");
+        MsgBox::Show(strMsg);
+    }
   
     build_dynamic_panel();
     try_resize_scroll();

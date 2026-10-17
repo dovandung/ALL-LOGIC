@@ -1487,6 +1487,11 @@ SR_API int ds_release_actived_device();
 
 SR_API int ds_get_last_error();
 
+/**
+ * Clear the last error, e.g. before a call whose own error is to be read.
+ */
+SR_API void ds_reset_last_error();
+
 SR_API int ds_reload_device_list();
 
 SR_API int ds_close_all_device();

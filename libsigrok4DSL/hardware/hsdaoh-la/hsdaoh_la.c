@@ -55,6 +55,9 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "hsdaoh-la: "
 
+/* GP0..GP7, one byte per sample */
+#define HL_NUM_CHANNELS		8
+
 /* the stick's USB IDs (libhsdaoh known_devices) */
 static const struct {
 	uint16_t vid, pid;
@@ -485,7 +488,7 @@ static void send_cross(struct hl_context *devc, const uint8_t *src, uint64_t n)
 		uint64_t k = n < SEND_CHUNK ? n : SEND_CHUNK;
 		uint64_t bytes = k / 64 * 8 * (uint64_t)devc->en_count;
 
-		hl_to_cross(src, k, devc->en_bits, devc->en_count, devc->cross_buf);
+		hl_to_cross(src, k, devc->en_bits, devc->en_count, devc->cross_buf, 1);
 		memset(&packet, 0, sizeof(packet));
 		memset(&logic, 0, sizeof(logic));
 		packet.type = SR_DF_LOGIC;
@@ -1093,7 +1096,7 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 
 	devc->cross_buf = g_try_malloc(SEND_CHUNK / 64 * 8 * HL_NUM_CHANNELS);
 	g_mutex_lock(&devc->mutex);
-	ret = devc->cross_buf ? hl_alloc(&devc->cap, pre, post) : -1;
+	ret = devc->cross_buf ? hl_alloc(&devc->cap, pre, post, 1) : -1;
 	if (ret == 0)
 		hl_reset(&devc->cap);
 	g_mutex_unlock(&devc->mutex);

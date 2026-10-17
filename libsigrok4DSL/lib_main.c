@@ -2065,6 +2065,11 @@ SR_PRIV void ds_set_last_error(int error)
 	lib_ctx.last_error = error;
 }
 
+SR_API void ds_reset_last_error()
+{
+	lib_ctx.last_error = SR_OK;
+}
+
 SR_API int ds_get_last_error()
 {
 	return lib_ctx.last_error;
