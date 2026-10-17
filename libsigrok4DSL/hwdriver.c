@@ -109,6 +109,9 @@ extern SR_PRIV struct sr_dev_driver atk_logic_driver_info;
 #ifdef HAVE_FX2LAFW_DEVICE
 extern SR_PRIV struct sr_dev_driver fx2lafw_driver_info;
 #endif
+#ifdef HAVE_HSDAOH_LA_DEVICE
+extern SR_PRIV struct sr_dev_driver hsdaoh_la_driver_info;
+#endif
 /** @endcond */
 
 static struct sr_dev_driver *drivers_list[] = {
@@ -133,6 +136,9 @@ static struct sr_dev_driver *drivers_list[] = {
 #endif
 #ifdef HAVE_FX2LAFW_DEVICE
 	&fx2lafw_driver_info,
+#endif
+#ifdef HAVE_HSDAOH_LA_DEVICE
+	&hsdaoh_la_driver_info,
 #endif
 	NULL,
 };
@@ -438,7 +444,8 @@ SR_PRIV int ds_scan_all_device_list(libusb_context *usb_ctx,struct libusb_device
             continue;
         }
 
-		/* DreamSourceLab + WCH CH32 + SLogic family + PXLogic + ATK-Logic + nanoDLA */
+		/* DreamSourceLab + WCH CH32 + SLogic family + PXLogic + ATK-Logic + nanoDLA
+		 * + hsdaoh MS213x HDMI capture sticks */
 		if (des.idVendor == DS_VENDOR_ID ||
 		    (des.idVendor == 0x1A86 &&
 		     (des.idProduct == 0x5537 || des.idProduct == 0x5538 ||
@@ -448,7 +455,9 @@ SR_PRIV int ds_scan_all_device_list(libusb_context *usb_ctx,struct libusb_device
 		      des.idProduct == 0x3032)) ||
 		    (des.idVendor == 0x16C0 && des.idProduct == 0x05DC) ||
 		    (des.idVendor == 0x1D50 &&
-		     (des.idProduct == 0x608C || des.idProduct == 0x608D))) {
+		     (des.idProduct == 0x608C || des.idProduct == 0x608D)) ||
+		    (des.idVendor == 0x345F &&
+		     des.idProduct >= 0x2130 && des.idProduct <= 0x2133)) {
 			if (wr >= size){
 				sr_err("ds_scan_all_device_list(), buffer length is too short.");
 				break;

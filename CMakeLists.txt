@@ -520,6 +520,31 @@ set(libsigrok4DSL_SOURCES
     libsigrok4DSL/lib_main.c
 )
 
+#===============================================================================
+#= hsdaoh-la: RP2350 la8 + MS2130 HDMI capture stick, needs libhsdaoh
+#= (github.com/dovandung/hsdaoh, branch la). Built when libhsdaoh is found;
+#= -DENABLE_HSDAOH_LA=OFF leaves it out.
+#-------------------------------------------------------------------------------
+option(ENABLE_HSDAOH_LA "Build the hsdaoh-la driver (needs libhsdaoh)" ON)
+if(ENABLE_HSDAOH_LA)
+	pkg_search_module(HSDAOH libhsdaoh)
+endif()
+if(HSDAOH_FOUND)
+	message("----- libhsdaoh (hsdaoh-la driver):")
+	message(STATUS "	 includes:" ${HSDAOH_INCLUDE_DIRS})
+	message(STATUS "	 libraries:" ${HSDAOH_LIBRARIES})
+	include_directories(${HSDAOH_INCLUDE_DIRS})
+	link_directories(${HSDAOH_LIBRARY_DIRS})
+	list(APPEND libsigrok4DSL_SOURCES
+		libsigrok4DSL/hardware/hsdaoh-la/hsdaoh_la.c
+		libsigrok4DSL/hardware/hsdaoh-la/hsdaoh_la_core.c
+		libsigrok4DSL/hardware/hsdaoh-la/pico_serial.c
+	)
+	add_definitions(-DHAVE_HSDAOH_LA_DEVICE=1)
+else()
+	message(STATUS "libhsdaoh not found: building without the hsdaoh-la driver")
+endif()
+
 # SLogic32U3 can deliver 800 MB/s. Its packet conversion is deliberately
 # optimized even in Debug builds so the USB producer cannot outrun the
 # session consumer while developers test the device.
@@ -690,6 +715,10 @@ set(DSVIEW_LINK_LIBS
 	${FFTW_LIBRARIES}
 	${PY_LIB}
 )
+
+if(HSDAOH_FOUND)
+	list(APPEND DSVIEW_LINK_LIBS ${HSDAOH_LIBRARIES})
+endif()
 
 if(WIN32)
 	# COM port lookup + timer precision for CH32 CDC IAP upgrade
