@@ -145,12 +145,136 @@ uint64_t slogic_samples_in_bytes(int nch, uint64_t bytes)
 	return bytes * 8 / (uint64_t)nch;
 }
 
+/* Unpacking below 8 channels is on the hot path of every capture (it runs
+ * for every delivered sample), so whole packed bytes go through SSE2 on x86
+ * and a 64-bit SWAR expansion elsewhere; partial bytes at either end keep
+ * the scalar code. Define SLOGIC_NO_SIMD to force the portable path. */
+#if (defined(__SSE2__) || defined(_M_X64)) && !defined(SLOGIC_NO_SIMD)
+#include <emmintrin.h>
+#define SLOGIC_HAVE_SSE2 1
+#endif
+
+/* Little-endian host check, used to gate the SWAR paths (which assume the
+ * first sample lands in the lowest-addressed byte of a 64-bit store). */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define SLOGIC_LE 1
+#elif defined(_WIN32) || defined(__x86_64__) || defined(__i386__) || defined(__aarch64__)
+#define SLOGIC_LE 1
+#endif
+
+#ifdef SLOGIC_LE
+static inline uint64_t ld64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+static inline uint32_t ld32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static inline uint16_t ld16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
+static inline void st64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
+
+/* 1 channel: one packed byte -> 8 bytes, byte k = bit k. */
+static inline uint64_t spread1(uint8_t b)
+{
+	uint64_t x = (uint64_t)b * 0x0101010101010101ULL;
+	x &= 0x8040201008040201ULL;
+	return ((x + 0x7f7f7f7f7f7f7f7fULL) >> 7) & 0x0101010101010101ULL;
+}
+
+/* 2 channels: two packed bytes (16 bits) -> 8 bytes, byte k = bits 2k..2k+1. */
+static inline uint64_t spread2(uint16_t v)
+{
+	uint64_t x = v;
+	x = (x | (x << 24)) & 0x000000ff000000ffULL;
+	x = (x | (x << 12)) & 0x000f000f000f000fULL;
+	x = (x | (x << 6)) & 0x0303030303030303ULL;
+	return x;
+}
+
+/* 4 channels: four packed bytes (32 bits) -> 8 bytes, byte k = nibble k. */
+static inline uint64_t spread4(uint32_t v)
+{
+	uint64_t x = v;
+	x = (x | (x << 16)) & 0x0000ffff0000ffffULL;
+	x = (x | (x << 8)) & 0x00ff00ff00ff00ffULL;
+	x = (x | (x << 4)) & 0x0f0f0f0f0f0f0f0fULL;
+	return x;
+}
+#endif
+
+/* Whole packed bytes [p, p+nbytes) -> nbytes*spb samples. Reads exactly
+ * nbytes bytes. Returns the number of bytes consumed by the fast paths;
+ * the caller finishes any remainder generically. */
+static size_t unpack_bytes_fast(int nch, const uint8_t *p, size_t nbytes,
+				uint8_t *out)
+{
+	size_t j = 0;
+	(void)p; (void)out;
+#ifdef SLOGIC_LE
+	switch (nch) {
+	case 4:
+#ifdef SLOGIC_HAVE_SSE2
+		{
+			const __m128i lo = _mm_set1_epi8(0x0f);
+			for (; j + 16 <= nbytes; j += 16) {
+				__m128i v = _mm_loadu_si128((const __m128i *)(p + j));
+				__m128i a = _mm_and_si128(v, lo);
+				__m128i b = _mm_and_si128(_mm_srli_epi16(v, 4), lo);
+				_mm_storeu_si128((__m128i *)(out + 2 * j), _mm_unpacklo_epi8(a, b));
+				_mm_storeu_si128((__m128i *)(out + 2 * j + 16), _mm_unpackhi_epi8(a, b));
+			}
+		}
+#endif
+		for (; j + 4 <= nbytes; j += 4)
+			st64(out + 2 * j, spread4(ld32(p + j)));
+		break;
+	case 2:
+#ifdef SLOGIC_HAVE_SSE2
+		{
+			const __m128i m = _mm_set1_epi8(0x03);
+			for (; j + 16 <= nbytes; j += 16) {
+				__m128i v = _mm_loadu_si128((const __m128i *)(p + j));
+				__m128i s0 = _mm_and_si128(v, m);
+				__m128i s1 = _mm_and_si128(_mm_srli_epi16(v, 2), m);
+				__m128i s2 = _mm_and_si128(_mm_srli_epi16(v, 4), m);
+				__m128i s3 = _mm_and_si128(_mm_srli_epi16(v, 6), m);
+				__m128i a = _mm_unpacklo_epi8(s0, s1), b = _mm_unpackhi_epi8(s0, s1);
+				__m128i c = _mm_unpacklo_epi8(s2, s3), d = _mm_unpackhi_epi8(s2, s3);
+				uint8_t *o = out + 4 * j;
+				_mm_storeu_si128((__m128i *)(o), _mm_unpacklo_epi16(a, c));
+				_mm_storeu_si128((__m128i *)(o + 16), _mm_unpackhi_epi16(a, c));
+				_mm_storeu_si128((__m128i *)(o + 32), _mm_unpacklo_epi16(b, d));
+				_mm_storeu_si128((__m128i *)(o + 48), _mm_unpackhi_epi16(b, d));
+			}
+		}
+#endif
+		for (; j + 2 <= nbytes; j += 2)
+			st64(out + 4 * j, spread2(ld16(p + j)));
+		break;
+	case 1:
+		for (; j + 8 <= nbytes; j += 8) {
+			uint64_t v = ld64(p + j);
+			uint8_t *o = out + 8 * j;
+			st64(o, spread1((uint8_t)v));
+			st64(o + 8, spread1((uint8_t)(v >> 8)));
+			st64(o + 16, spread1((uint8_t)(v >> 16)));
+			st64(o + 24, spread1((uint8_t)(v >> 24)));
+			st64(o + 32, spread1((uint8_t)(v >> 32)));
+			st64(o + 40, spread1((uint8_t)(v >> 40)));
+			st64(o + 48, spread1((uint8_t)(v >> 48)));
+			st64(o + 56, spread1((uint8_t)(v >> 56)));
+		}
+		for (; j < nbytes; j++)
+			st64(out + 8 * j, spread1(p[j]));
+		break;
+	default:
+		break;
+	}
+#endif
+	return j;
+}
+
 size_t slogic_unpack_range(int nch, const uint8_t *packed, uint64_t first,
 			   size_t nsamples, uint8_t *out)
 {
 	unsigned spb, k;
 	uint8_t mask;
-	size_t i = 0;
+	size_t i = 0, nbytes, done;
 	const uint8_t *p;
 
 	if (nch >= 8) {
@@ -167,22 +291,17 @@ size_t slogic_unpack_range(int nch, const uint8_t *packed, uint64_t first,
 		out[i++] = (packed[first / spb] >> ((first % spb) * nch)) & mask;
 		first++;
 	}
-	/* Whole bytes. */
+	/* Whole bytes: vector/SWAR fast path, then the generic loop for the rest. */
 	p = packed + first / spb;
-	if (nch == 4) {
-		while (nsamples - i >= 2) {
-			uint8_t b = *p++;
-			out[i] = b & 0x0f;
-			out[i + 1] = b >> 4;
-			i += 2;
-		}
-	} else {
-		while (nsamples - i >= spb) {
-			uint8_t b = *p++;
-			for (k = 0; k < spb; k++)
-				out[i + k] = (b >> (k * nch)) & mask;
-			i += spb;
-		}
+	nbytes = (nsamples - i) / spb;
+	done = unpack_bytes_fast(nch, p, nbytes, out + i);
+	p += done;
+	i += done * spb;
+	for (; done < nbytes; done++) {
+		uint8_t b = *p++;
+		for (k = 0; k < spb; k++)
+			out[i + k] = (b >> (k * nch)) & mask;
+		i += spb;
 	}
 	/* Trailing partial byte: only the samples asked for are read. */
 	for (k = 0; i < nsamples; k++)
