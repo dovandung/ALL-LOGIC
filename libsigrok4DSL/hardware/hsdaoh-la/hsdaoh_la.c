@@ -49,7 +49,7 @@
 
 #include "../../libsigrok-internal.h"
 #include "../../log.h"
-#include "hsdaoh_la_core.h"
+#include "../common/capture_core.h"
 #include "pico_serial.h"
 
 #undef LOG_PREFIX

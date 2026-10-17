@@ -70,8 +70,9 @@ found. On Windows, ship `libhsdaoh.dll` and `libuvc.dll` next to
 ## Files
 
 - `hsdaoh_la.c` - the driver (device list, settings, acquisition)
-- `hsdaoh_la_core.c/.h` - trigger, pre-trigger history, capture buffer,
-  lost-data handling and the LA_CROSS_DATA conversion; no ALL LOGIC or
-  libhsdaoh dependency, so it can be tested on its own
+- `../common/capture_core.c/.h` - trigger, pre-trigger history, capture
+  buffer, lost-data handling and the LA_CROSS_DATA conversion (shared with
+  the cypress-fx3 driver); no ALL LOGIC or libhsdaoh dependency, so it can
+  be tested on its own
 - `pico_serial.c/.h` - serial port access and the la8 commands
   (libsigrok4DSL has no serial layer)

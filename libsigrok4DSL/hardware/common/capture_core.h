@@ -1,5 +1,5 @@
 /*
- * hsdaoh-la capture core for ALL LOGIC (libsigrok4DSL).
+ * Host-side capture core for ALL LOGIC (libsigrok4DSL) drivers.
  *
  * Copyright (C) 2026 Do Van Dung <do_van_dzung@yahoo.com>
  *
@@ -18,12 +18,14 @@
  */
 
 /*
- * The part of the driver that does not depend on DSView or libhsdaoh, so it
- * can be tested on its own: trigger search, pre-trigger history, capture
- * buffer, lost-data handling (ported from the libsigrok hsdaoh-la driver's
- * protocol.c) and the conversion to DSView's LA_CROSS_DATA layout.
+ * For analyzers that stream every sample to the PC and leave the trigger to
+ * the host (hsdaoh-la, cypress-fx3): trigger search, pre-trigger history,
+ * capture buffer, lost-data handling (from the libsigrok hsdaoh-la driver's
+ * protocol.c) and the conversion to DSView's LA_CROSS_DATA layout. Up to 8
+ * channels, 1 byte per sample. No dependency on DSView or a device library,
+ * so it can be tested on its own.
  *
- * Acquisition model (same as the libsigrok driver):
+ * Acquisition model:
  *   - the stream is scanned on the PC for the trigger condition
  *   - pre-trigger + post-trigger samples are collected in RAM
  *   - only when the capture is complete is it sent to the session
@@ -33,8 +35,8 @@
  * Not thread safe: the driver serializes access with its own mutex.
  */
 
-#ifndef LIBSIGROK_HARDWARE_HSDAOH_LA_CORE_H
-#define LIBSIGROK_HARDWARE_HSDAOH_LA_CORE_H
+#ifndef LIBSIGROK_HARDWARE_COMMON_CAPTURE_CORE_H
+#define LIBSIGROK_HARDWARE_COMMON_CAPTURE_CORE_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -102,6 +104,13 @@ void hl_invalidate_counter(struct hl_capture *c);
  */
 int hl_feed(struct hl_capture *c, const uint8_t *buf, size_t words,
 	    uint64_t data_cnt);
+
+/*
+ * Feed n samples, 1 byte each (bit k = channel k), in stream order, from a
+ * device without a stream counter (lost data cannot be detected). Only acts
+ * while the state is HL_ARMED or HL_CAPTURING.
+ */
+void hl_feed_bytes(struct hl_capture *c, const uint8_t *s, size_t n);
 
 /*
  * Convert n samples (n a multiple of 64; 1 byte per sample, bit k = channel

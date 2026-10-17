@@ -500,6 +500,9 @@ set(libsigrok4DSL_SOURCES
     libsigrok4DSL/hardware/DSL/dslogic.c
     libsigrok4DSL/hardware/common/usb.c
     libsigrok4DSL/hardware/common/ezusb.c
+    libsigrok4DSL/hardware/common/capture_core.c
+    libsigrok4DSL/hardware/common/fx3load.c
+    libsigrok4DSL/hardware/cypress-fx3/cypress_fx3.c
     libsigrok4DSL/trigger.c
     libsigrok4DSL/dsdevice.c
     libsigrok4DSL/hardware/DSL/dscope.c
@@ -537,7 +540,6 @@ if(HSDAOH_FOUND)
 	link_directories(${HSDAOH_LIBRARY_DIRS})
 	list(APPEND libsigrok4DSL_SOURCES
 		libsigrok4DSL/hardware/hsdaoh-la/hsdaoh_la.c
-		libsigrok4DSL/hardware/hsdaoh-la/hsdaoh_la_core.c
 		libsigrok4DSL/hardware/hsdaoh-la/pico_serial.c
 	)
 	add_definitions(-DHAVE_HSDAOH_LA_DEVICE=1)
@@ -659,6 +661,7 @@ add_definitions(
 	-DHAVE_ATKLOGIC_DEVICE=1
 	-DHAVE_FX2LAFW_DEVICE=1
 	-DHAVE_SLOGIC_DEVICE=1
+	-DHAVE_CYPRESS_FX3_DEVICE=1
 )
 
 if(NOT DISABLE_WERROR)

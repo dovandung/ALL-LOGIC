@@ -1,5 +1,5 @@
 /*
- * hsdaoh-la capture core for ALL LOGIC (libsigrok4DSL).
+ * Host-side capture core for ALL LOGIC (libsigrok4DSL) drivers.
  *
  * Copyright (C) 2026 Do Van Dung <do_van_dzung@yahoo.com>
  *
@@ -19,7 +19,7 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include "hsdaoh_la_core.h"
+#include "capture_core.h"
 
 #define HL_MIN(a, b) ((a) < (b) ? (a) : (b))
 
@@ -287,6 +287,14 @@ int hl_feed(struct hl_capture *c, const uint8_t *buf, size_t words,
 	}
 	process(c, c->unpack, n);
 	return lost;
+}
+
+void hl_feed_bytes(struct hl_capture *c, const uint8_t *s, size_t n)
+{
+	if (c->state != HL_ARMED && c->state != HL_CAPTURING)
+		return;
+	if (n)
+		process(c, s, n);
 }
 
 /* ---------------------------------------------------------- cross format */
