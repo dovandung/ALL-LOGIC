@@ -1,6 +1,6 @@
 # ALL LOGIC
 
-[English](#english) · [中文](#中文)
+[English](#english) 
 I using AI CLAUDE to convert libsigrok of FX3 , HSDAOH to ALLLOGIC driver and it works ok
 ALL LOGIC is an **unofficial** multi-vendor logic analyzer host.
 
@@ -27,6 +27,8 @@ These were added in this secondary development. They are **not** official vendor
 3. **PXLogic32U3 (5 Gbps)** — [MarryChip](https://marrychip.com/)
 4. **ATK-Logic (Alientek DL16 etc.)** — [official host source](https://github.com/alientek-openedv/atk-logic)
 5. **nanoDLA / Cypress FX2 (fx2lafw)** — [wuxx/nanoDLA](https://github.com/wuxx/nanoDLA)
+6. FX3 Cypress
+7. HSDAOH-RP2350
 
 DreamSourceLab instruments already supported by upstream DSView still work.
 
