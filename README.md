@@ -1,6 +1,6 @@
 # ALL LOGIC
 
-[English](#english) 
+
 I using AI CLAUDE to convert libsigrok of FX3 , HSDAOH to ALLLOGIC driver and it works ok
 ALL LOGIC is an **unofficial** multi-vendor logic analyzer host.
 
