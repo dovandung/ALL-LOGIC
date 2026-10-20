@@ -389,7 +389,8 @@ int pico_la8_command(const char *port, const char *cmd, char *reply,
 	}
 
 	/* The status answer ends with the "commands:" help line; a refused
-	 * divider is a single "divider must be ..." line. */
+	 * divider is a single "divider must be ..." line, a refused channel
+	 * count (la48 "ch N") a single "channels must be ..." line. */
 	deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
 	while (g_get_monotonic_time() < deadline && len < reply_size - 1) {
 		int n = pico_serial_read(s, reply + len, reply_size - 1 - len, 50);
@@ -402,11 +403,14 @@ int pico_la8_command(const char *port, const char *cmd, char *reply,
 		reply[len] = 0;
 		if (strstr(reply, "commands:")) {
 			ret = (strstr(reply, "divider must be") ||
+			       strstr(reply, "channels must be") ||
 			       strstr(reply, "unknown command")) ?
 				PICO_LA8_REFUSED : PICO_LA8_OK;
 			break;
 		}
 		refused = strstr(reply, "divider must be");
+		if (!refused)
+			refused = strstr(reply, "channels must be");
 		if (refused && strchr(refused, '\n')) {
 			ret = PICO_LA8_REFUSED;
 			break;
@@ -428,6 +432,28 @@ int pico_la8_parse_status(const char *reply, unsigned int *sys_mhz,
 		return -1;
 	p = strstr(reply, "minimum divider ");
 	if (!p || sscanf(p, "minimum divider %u", min_div) != 1 || !*min_div)
+		return -1;
+	return 0;
+}
+
+int pico_la8_parse_la48(const char *reply, unsigned int *min_div8,
+			unsigned int *min_div4)
+{
+	const char *p, *p8, *p4;
+
+	p = strstr(reply, "la48 switchable:");
+	if (!p)
+		return -1;
+	p8 = strstr(p, "ch 8 (");
+	p4 = strstr(p, "ch 4 (");
+	if (!p8 || !p4)
+		return -1;
+	p8 = strstr(p8, "minimum divider ");
+	p4 = strstr(p4, "minimum divider ");
+	if (!p8 || !p4 ||
+	    sscanf(p8, "minimum divider %u", min_div8) != 1 ||
+	    sscanf(p4, "minimum divider %u", min_div4) != 1 ||
+	    !*min_div8 || !*min_div4)
 		return -1;
 	return 0;
 }

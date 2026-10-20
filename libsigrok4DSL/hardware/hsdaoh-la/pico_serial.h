@@ -55,10 +55,11 @@ int pico_serial_read(struct pico_serial *s, void *buf, size_t len,
 		     int timeout_ms);
 
 
-/* ---- la8 firmware protocol ---- */
+/* ---- la8 / la4 / la48 firmware protocol ---- */
 enum {
 	PICO_LA8_OK = 0,
-	PICO_LA8_REFUSED = 1,		/* "divider must be ...", "unknown command" */
+	PICO_LA8_REFUSED = 1,		/* "divider must be ...", "channels must
+					 * be ...", "unknown command" */
 	PICO_LA8_NO_ANSWER = -1,	/* nothing (complete) within 2 s */
 	PICO_LA8_OPEN_ERROR = -2,	/* port busy or gone */
 	PICO_LA8_IO_ERROR = -3,
@@ -70,5 +71,9 @@ int pico_la8_command(const char *port, const char *cmd, char *reply,
 /* Parse "... (sys 280 MHz / 2), minimum divider 2, ...". 0 or -1. */
 int pico_la8_parse_status(const char *reply, unsigned int *sys_mhz,
 			  unsigned int *div, unsigned int *min_div);
+/* Parse the la48 line "la48 switchable: ch 8 (GP0..GP7, minimum divider 2)
+ * or ch 4 (GP0..GP3, minimum divider 1)". 0, or -1 if not la48. */
+int pico_la8_parse_la48(const char *reply, unsigned int *min_div8,
+			unsigned int *min_div4);
 
 #endif

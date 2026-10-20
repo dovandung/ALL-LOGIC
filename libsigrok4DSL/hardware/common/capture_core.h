@@ -111,6 +111,13 @@ void hl_invalidate_counter(struct hl_capture *c);
  */
 int hl_feed(struct hl_capture *c, const uint8_t *buf, size_t words,
 	    uint64_t data_cnt);
+/*
+ * Same with `spw` samples per word: 2 (la8, as hl_feed) or 4 (la4: 4-bit
+ * samples, the earliest in bits 15:12 of the word, stored one per byte in
+ * bits 3:0). The lost-data counter still counts words.
+ */
+int hl_feed_spw(struct hl_capture *c, const uint8_t *buf, size_t words,
+		uint64_t data_cnt, unsigned int spw);
 
 /*
  * Feed nbytes of samples (`unit` bytes each, bit k = channel k) in stream

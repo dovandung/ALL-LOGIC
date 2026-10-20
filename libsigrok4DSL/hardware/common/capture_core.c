@@ -303,12 +303,18 @@ static void process(struct hl_capture *c, const uint8_t *s, size_t n)
 int hl_feed(struct hl_capture *c, const uint8_t *buf, size_t words,
 	    uint64_t data_cnt)
 {
+	return hl_feed_spw(c, buf, words, data_cnt, 2);
+}
+
+int hl_feed_spw(struct hl_capture *c, const uint8_t *buf, size_t words,
+		uint64_t data_cnt, unsigned int spw)
+{
 	size_t n, w;
 	int lost = 0;
 
 	if (c->state != HL_ARMED && c->state != HL_CAPTURING)
 		return 0;
-	if (!words || c->unit != 1)
+	if (!words || c->unit != 1 || (spw != 2 && spw != 4))
 		return 0;
 
 	/* lost data: the device's word counter does not continue */
@@ -326,7 +332,7 @@ int hl_feed(struct hl_capture *c, const uint8_t *buf, size_t words,
 	c->next_cnt = data_cnt + words;
 	c->cnt_valid = 1;
 
-	n = words * 2;
+	n = words * spw;
 	if (n > c->unpack_size) {
 		free(c->unpack);
 		c->unpack = malloc(n);
@@ -336,11 +342,23 @@ int hl_feed(struct hl_capture *c, const uint8_t *buf, size_t words,
 			return -1;
 		}
 	}
-	/* two samples per 16-bit word, the earlier one in the high byte; the
-	 * words arrive little endian: swap the bytes of every word */
-	for (w = 0; w < words; w++) {
-		c->unpack[2 * w] = buf[2 * w + 1];
-		c->unpack[2 * w + 1] = buf[2 * w];
+	if (spw == 4) {
+		/* la4: four 4-bit samples per word, the earliest in bits 15:12;
+		 * the words arrive little endian */
+		for (w = 0; w < words; w++) {
+			uint8_t hi = buf[2 * w + 1], lo = buf[2 * w];
+			c->unpack[4 * w] = hi >> 4;
+			c->unpack[4 * w + 1] = hi & 0x0f;
+			c->unpack[4 * w + 2] = lo >> 4;
+			c->unpack[4 * w + 3] = lo & 0x0f;
+		}
+	} else {
+		/* la8: two samples per 16-bit word, the earlier one in the high
+		 * byte; the words arrive little endian: swap the bytes */
+		for (w = 0; w < words; w++) {
+			c->unpack[2 * w] = buf[2 * w + 1];
+			c->unpack[2 * w + 1] = buf[2 * w];
+		}
 	}
 	process(c, c->unpack, n);
 	return lost;

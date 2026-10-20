@@ -18,10 +18,16 @@
  */
 
 /*
- * hsdaoh la8: 8 channel logic analyzer made of a Raspberry Pi Pico 2
- * (RP2350) running the hsdaoh-rp2350 "la8" firmware and an MS2130 USB3 HDMI
- * capture stick. The Pico samples GP0..GP7 continuously and streams every
- * sample over HDMI; libhsdaoh receives the stream on the PC.
+ * hsdaoh-la: logic analyzer made of a Raspberry Pi Pico 2 (RP2350) running
+ * an hsdaoh-rp2350 logic analyzer firmware and an MS2130 USB3 HDMI capture
+ * stick. The Pico samples its inputs continuously and streams every sample
+ * over HDMI; libhsdaoh receives the stream on the PC. Firmwares:
+ *   - la8:  GP0..GP7, up to 140 MS/s (two samples per 16-bit link word)
+ *   - la4:  GP0..GP3, up to 280 MS/s (four samples per link word)
+ *   - la48: either of the two, switched over the USB serial port with
+ *           "ch 8" / "ch 4"; offered here as the device's channel mode
+ * Every buffer is unpacked by the stream format the device reports
+ * (PIO_8BIT or PIO_4BIT), so the data is right whatever the firmware.
  *
  * Port of the libsigrok hsdaoh-la driver (github.com/dovandung/libsigrok,
  * branch hsdaoh-la) to libsigrok4DSL. Differences from the libsigrok
@@ -55,8 +61,14 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "hsdaoh-la: "
 
-/* GP0..GP7, one byte per sample */
+/* at most GP0..GP7, one byte per sample in the driver */
 #define HL_NUM_CHANNELS		8
+
+/* la48 channel modes (SR_CONF_CHANNEL_MODE) */
+enum {
+	HL_MODE_8CH = 0,
+	HL_MODE_4CH = 1,
+};
 
 /* the stick's USB IDs (libhsdaoh known_devices) */
 static const struct {
@@ -76,7 +88,7 @@ static const struct {
 
 /* used until the device has reported its rate in the stream metadata */
 #define DEFAULT_SAMPLERATE	SR_MHZ(140)
-/* the la8 firmware's divider range */
+/* the firmware's divider range */
 #define MAX_DIVIDER		65535
 /* how long dev_open waits for the stream's sample rate (no serial port) */
 #define RATE_WAIT_MS		1500
@@ -107,6 +119,21 @@ static const int32_t sessions[] = {
 	SR_CONF_LIMIT_SAMPLES,
 };
 
+/* la48: the same plus the channel mode (8 or 4 channels) */
+static const int32_t hwoptions_la48[] = {
+	SR_CONF_OPERATION_MODE,
+	SR_CONF_CHANNEL_MODE,
+	SR_CONF_MAX_HEIGHT,
+};
+
+static const int32_t sessions_la48[] = {
+	SR_CONF_MAX_HEIGHT,
+	SR_CONF_OPERATION_MODE,
+	SR_CONF_CHANNEL_MODE,
+	SR_CONF_SAMPLERATE,
+	SR_CONF_LIMIT_SAMPLES,
+};
+
 static const struct sr_list_item opmode_list[] = {
 	{ LO_OP_STREAM, "Stream Mode" },
 	{ -1, NULL },
@@ -129,8 +156,17 @@ struct hl_context {
 	/* optional Pico USB serial port for setting the sample rate */
 	char *port;
 	uint64_t sys_clock;		/* Pico system clock in Hz (0 = unknown) */
-	unsigned int min_div;		/* smallest divider the firmware accepts */
+	unsigned int min_div;		/* smallest divider in the current mode */
 	unsigned int cur_div;
+
+	/* channels: la8 8, la4 4, la48 8 or 4 (its channel mode) */
+	unsigned int channels;		/* channels of the device (8 for la48) */
+	unsigned int fw_channels;	/* channels the firmware samples now */
+	gboolean switchable;		/* la48 */
+	unsigned int min_div8, min_div4;	/* la48: minimum per mode */
+	char mode_name[2][48];
+	struct sr_list_item mode_list[3];
+	volatile unsigned int stream_ch; /* 8 / 4 from the stream format, 0 unknown */
 	uint64_t *samplerate_list;
 	unsigned int num_samplerates;
 
@@ -171,6 +207,16 @@ static int known_stick(uint16_t vid, uint16_t pid)
 static uint64_t la8_rate(uint64_t sys_clock, uint64_t div)
 {
 	return (sys_clock + div / 2) / div;
+}
+
+/* "140MHz", "93.3MHz", "500kHz" */
+static void rate_str(char *buf, size_t size, uint64_t rate)
+{
+	if (rate >= SR_MHZ(1))
+		snprintf(buf, size, rate % SR_MHZ(1) ? "%.1fMHz" : "%.0fMHz",
+			 (double)rate / 1e6);
+	else
+		snprintf(buf, size, "%.0fkHz", (double)rate / 1e3);
 }
 
 static int cmp_u64(const void *a, const void *b)
@@ -246,34 +292,80 @@ static int pico_command(const char *port, const char *cmd, char *reply,
 		if (reply[0])
 			sr_err("Incomplete answer from the Pico on %s: %s", port, reply);
 		else
-			sr_err("No answer from the Pico on %s (is la8 running?).", port);
+			sr_err("No answer from the Pico on %s (is la8, la4 or la48 "
+			       "running?).", port);
 		return SR_ERR;
 	}
 }
 
-/* Take over the la8 status: system clock, divider, minimum divider. */
+/*
+ * Take over the firmware status: system clock, divider, minimum divider and
+ * the current channel count, e.g.
+ * "la8: GP0..GP7, 140.000 MS/s (sys 280 MHz / 2), minimum divider 2, ..."
+ * "la4: GP0..GP3, 280.000 MS/s (sys 280 MHz / 1), minimum divider 1, ..."
+ * la48 prints one of these for its current mode, then
+ * "la48 switchable: ch 8 (GP0..GP7, minimum divider 2) or ch 4 (GP0..GP3,
+ * minimum divider 1)".
+ */
 static int pico_parse_status(struct hl_context *devc, const char *reply)
 {
-	unsigned int sys_mhz, div, min_div;
+	unsigned int sys_mhz, div, min_div, m8, m4;
 
 	if (pico_la8_parse_status(reply, &sys_mhz, &div, &min_div) != 0)
 		return SR_ERR;
 	devc->sys_clock = (uint64_t)sys_mhz * 1000000;
 	devc->cur_div = div;
 	devc->min_div = min_div;
+	devc->fw_channels = strstr(reply, "la4:") ? 4 : 8;
+	if (pico_la8_parse_la48(reply, &m8, &m4) == 0) {
+		devc->switchable = TRUE;
+		devc->min_div8 = m8;
+		devc->min_div4 = m4;
+		devc->min_div = devc->fw_channels == 4 ? m4 : m8;
+	}
 	devc->samplerate = la8_rate(devc->sys_clock, div);
 	return SR_OK;
 }
 
-/* ask the la8 firmware on `port` for its status; TRUE if it answered */
+/* la48 channel mode names, with the mode's fastest rate */
+static void build_mode_list(struct hl_context *devc)
+{
+	char r8[16], r4[16];
+
+	rate_str(r8, sizeof(r8), la8_rate(devc->sys_clock, devc->min_div8));
+	rate_str(r4, sizeof(r4), la8_rate(devc->sys_clock, devc->min_div4));
+	snprintf(devc->mode_name[0], sizeof(devc->mode_name[0]),
+		 "Use Channels 0~7 (Max %s)", r8);
+	snprintf(devc->mode_name[1], sizeof(devc->mode_name[1]),
+		 "Use Channels 0~3 (Max %s)", r4);
+	devc->mode_list[0].id = HL_MODE_8CH;
+	devc->mode_list[0].name = devc->mode_name[0];
+	devc->mode_list[1].id = HL_MODE_4CH;
+	devc->mode_list[1].name = devc->mode_name[1];
+	devc->mode_list[2].id = -1;
+	devc->mode_list[2].name = NULL;
+}
+
+/* ask the firmware on `port` for its status; TRUE if it answered */
 static gboolean probe_pico(struct hl_context *devc, const char *port)
 {
 	char reply[1024];
 
 	if (pico_command(port, "?", reply, sizeof(reply)) == SR_OK &&
-	    strstr(reply, "la8") && pico_parse_status(devc, reply) == SR_OK) {
-		sr_info("la8 on %s: system clock %" PRIu64 " Hz, divider %u (minimum %u).",
-			port, devc->sys_clock, devc->cur_div, devc->min_div);
+	    (strstr(reply, "la8:") || strstr(reply, "la4:")) &&
+	    pico_parse_status(devc, reply) == SR_OK) {
+		devc->channels = devc->switchable ? 8 : devc->fw_channels;
+		if (devc->switchable) {
+			build_mode_list(devc);
+			sr_info("la48 on %s: system clock %" PRIu64 " Hz, %u channel "
+				"mode, divider %u (minimum %u with 8 channels, %u "
+				"with 4).", port, devc->sys_clock, devc->fw_channels,
+				devc->cur_div, devc->min_div8, devc->min_div4);
+		} else {
+			sr_info("la%u on %s: system clock %" PRIu64 " Hz, divider %u "
+				"(minimum %u).", devc->fw_channels, port,
+				devc->sys_clock, devc->cur_div, devc->min_div);
+		}
 		g_free(devc->port);
 		devc->port = g_strdup(port);
 		build_samplerate_list(devc);
@@ -304,7 +396,7 @@ static gboolean generic_usb_cdc(const struct pico_port *p)
  *  2. ports with the Pico SDK's USB IDs
  *  3. other generic USB CDC ports ("USB Serial Device (COMx)" on Windows,
  *     /dev/ttyACMx on Linux), for when the USB IDs cannot be read
- * Only the la8 status command "?" is sent.
+ * Only the status command "?" is sent.
  */
 static void find_pico(struct hl_context *devc)
 {
@@ -341,7 +433,7 @@ static void find_pico(struct hl_context *devc)
 	pico_port_list_free(ports);
 
 	if (!devc->port)
-		sr_warn("No la8 serial port found (tried %u). The sample rate cannot "
+		sr_warn("No la8 / la4 / la48 serial port found (tried %u). The sample rate cannot "
 			"be changed: close other programs using the Pico's COM port, "
 			"or set HSDAOH_LA_PORT.", g_slist_length(tried));
 out:
@@ -354,6 +446,7 @@ out:
 static void hl_data_cb(hsdaoh_data_info_t *info)
 {
 	struct hl_context *devc = info->ctx;
+	unsigned int spw;
 	int r;
 
 	if (info->stream_id != 0)
@@ -377,7 +470,14 @@ static void hl_data_cb(hsdaoh_data_info_t *info)
 		goto out;
 	}
 
-	r = hl_feed(&devc->cap, info->buf, info->len / 2, info->data_cnt);
+#ifdef HSDAOH_FORMAT_PIO_4BIT
+	/* libhsdaoh la >= 25951fc reports the stream format */
+	spw = info->format == HSDAOH_FORMAT_PIO_4BIT ? 4 : 2;
+#else
+	spw = 2;
+#endif
+	devc->stream_ch = spw == 4 ? 4 : 8;
+	r = hl_feed_spw(&devc->cap, info->buf, info->len / 2, info->data_cnt, spw);
 	if (r == 1) {
 		/* hl_feed restarted the pre-trigger history, and discarded a
 		 * capture in progress (it would contain a hole) */
@@ -459,7 +559,7 @@ static int set_samplerate(struct hl_context *devc, uint64_t rate)
 	snprintf(cmd, sizeof(cmd), "div %u", (unsigned int)div);
 	ret = pico_command(devc->port, cmd, reply, sizeof(reply));
 	if (ret == SR_ERR_ARG) {
-		sr_err("la8 refused '%s': %s", cmd, reply);
+		sr_err("The Pico refused '%s': %s", cmd, reply);
 		return SR_ERR_ARG;
 	}
 	if (ret != SR_OK)
@@ -474,6 +574,69 @@ static int set_samplerate(struct hl_context *devc, uint64_t rate)
 	devc->skip_bufs = 3;
 	g_mutex_unlock(&devc->mutex);
 	sr_info("Sample rate %" PRIu64 " Hz (divider %u).", devc->samplerate, devc->cur_div);
+	return SR_OK;
+}
+
+/* DSView channel enable: the channels the firmware samples now */
+static void apply_channel_count(struct hl_context *devc, struct sr_dev_inst *sdi)
+{
+	GSList *l;
+
+	for (l = sdi->channels; l; l = l->next) {
+		struct sr_channel *ch = l->data;
+		if (ch->type == SR_CHANNEL_LOGIC)
+			ch->enabled = ch->index < (int)devc->fw_channels;
+	}
+}
+
+/*
+ * la48: switch the firmware to 8 or 4 channels ("ch 8" / "ch 4"). The
+ * firmware raises the divider to the new mode's minimum if needed, and
+ * answers with its status. The sample rate list follows the mode.
+ */
+static int set_channel_mode(struct hl_context *devc, struct sr_dev_inst *sdi,
+			    int mode)
+{
+	char cmd[16], reply[1024];
+	unsigned int want;
+	int ret;
+
+	if (mode != HL_MODE_8CH && mode != HL_MODE_4CH)
+		return SR_ERR_ARG;
+	want = mode == HL_MODE_4CH ? 4 : 8;
+	if (!devc->switchable || !devc->port)
+		return want == devc->fw_channels ? SR_OK : SR_ERR_NA;
+	if (want == devc->fw_channels)
+		return SR_OK;
+
+	snprintf(cmd, sizeof(cmd), "ch %u", want);
+	ret = pico_command(devc->port, cmd, reply, sizeof(reply));
+	if (ret == SR_ERR_ARG) {
+		sr_err("The Pico refused '%s': %s", cmd, reply);
+		return SR_ERR_ARG;
+	}
+	if (ret != SR_OK)
+		return ret;
+	if (pico_parse_status(devc, reply) != SR_OK) {
+		/* no status in the answer: ask for it */
+		if (pico_command(devc->port, "?", reply, sizeof(reply)) != SR_OK ||
+		    pico_parse_status(devc, reply) != SR_OK) {
+			sr_err("No status from the Pico after '%s'.", cmd);
+			return SR_ERR;
+		}
+	}
+	if (devc->fw_channels != want) {
+		sr_err("The Pico still runs %u channels after '%s'.",
+		       devc->fw_channels, cmd);
+		return SR_ERR;
+	}
+	build_samplerate_list(devc);
+	g_mutex_lock(&devc->mutex);
+	devc->skip_bufs = 3;
+	g_mutex_unlock(&devc->mutex);
+	apply_channel_count(devc, sdi);
+	sr_info("la48: %u channel mode, %" PRIu64 " Hz (divider %u, minimum %u).",
+		devc->fw_channels, devc->samplerate, devc->cur_div, devc->min_div);
 	return SR_OK;
 }
 
@@ -634,12 +797,12 @@ static int hw_cleanup(void)
 	return SR_OK;
 }
 
-static void setup_channels(struct sr_dev_inst *sdi)
+static void setup_channels(struct sr_dev_inst *sdi, unsigned int n)
 {
 	char name[16];
 	int i;
 
-	for (i = 0; i < HL_NUM_CHANNELS; i++) {
+	for (i = 0; i < (int)n; i++) {
 		snprintf(name, sizeof(name), "%d", i);
 		sdi->channels = g_slist_append(sdi->channels,
 			sr_channel_new(i, SR_CHANNEL_LOGIC, TRUE, name));
@@ -691,13 +854,18 @@ static GSList *hw_scan(GSList *options)
 		devc->limit_samples = DEFAULT_SAMPLES;
 		devc->max_height = 1;
 		devc->cap.state = HL_IDLE;
+		devc->channels = HL_NUM_CHANNELS;
+		devc->fw_channels = HL_NUM_CHANNELS;
 
 		/* the serial port belongs to the Pico on the first stick */
 		if (devc->hsdaoh_index == 0)
 			find_pico(devc);
 
 		sdi = sr_dev_inst_new(LOGIC, SR_ST_INACTIVE, "hsdaoh",
-				      "la8 (RP2350 + MS2130)", "hsdaoh-la");
+				      devc->switchable ? "la48 (RP2350 + MS2130)" :
+				      (devc->port && devc->fw_channels == 4) ?
+				      "la4 (RP2350 + MS2130)" : "la8 (RP2350 + MS2130)",
+				      "hsdaoh-la");
 		if (!sdi) {
 			libusb_unref_device(devc->usb_dev);
 			g_mutex_clear(&devc->mutex);
@@ -716,11 +884,14 @@ static GSList *hw_scan(GSList *options)
 			usb_info->usb_dev = devc->usb_dev;
 			sdi->conn = usb_info;
 		}
-		setup_channels(sdi);
-		sr_info("Found %s %04x:%04x as hsdaoh #%u%s%s",
+		setup_channels(sdi, devc->channels);
+		apply_channel_count(devc, sdi);
+		sr_info("Found %s %04x:%04x as hsdaoh #%u%s%s%s",
 			sticks[k].name, des.idVendor, des.idProduct,
-			devc->hsdaoh_index, devc->port ? ", la8 on " : "",
-			devc->port ? devc->port : "");
+			devc->hsdaoh_index, !devc->port ? "" : devc->switchable ?
+			", la48 on " : devc->fw_channels == 4 ? ", la4 on " :
+			", la8 on ", devc->port ? devc->port : "",
+			devc->port ? "" : " (firmware unknown without its serial port)");
 		devices = g_slist_append(devices, sdi);
 	}
 	libusb_free_device_list(devlist, 0);
@@ -739,7 +910,7 @@ static const GSList *hw_dev_mode_list(const struct sr_dev_inst *sdi)
 /* Without the Pico's serial port: start the stream and read the rate the
  * device reports in the HDMI metadata, since DSView does not accept a
  * rate change after the capture. */
-static void learn_stream_rate(struct hl_context *devc)
+static void learn_stream_rate(struct hl_context *devc, struct sr_dev_inst *sdi)
 {
 	gint64 deadline;
 
@@ -752,6 +923,12 @@ static void learn_stream_rate(struct hl_context *devc)
 		devc->samplerate = devc->stream_srate;
 		sr_info("Sample rate from the HDMI stream: %" PRIu64 " Hz.",
 			devc->samplerate);
+		/* la4 (or la48 in 4 channel mode): only D0..D3 carry data */
+		if (devc->stream_ch && devc->stream_ch != devc->fw_channels) {
+			devc->fw_channels = devc->stream_ch;
+			apply_channel_count(devc, sdi);
+			sr_info("The HDMI stream carries %u channels.", devc->fw_channels);
+		}
 	} else {
 		sr_warn("No sample rate in the HDMI stream yet, assuming %" PRIu64 " Hz.",
 			devc->samplerate);
@@ -776,7 +953,7 @@ static int hw_dev_open(struct sr_dev_inst *sdi)
 	sdi->status = SR_ST_ACTIVE;
 
 	if (!devc->port)
-		learn_stream_rate(devc);
+		learn_stream_rate(devc, sdi);
 	return SR_OK;
 }
 
@@ -871,8 +1048,17 @@ static int config_get(int id, GVariant **data, const struct sr_dev_inst *sdi,
 		*data = g_variant_new_uint64(MAX_SAMPLES);
 		break;
 	case SR_CONF_TOTAL_CH_NUM:
+		*data = g_variant_new_int16((int16_t)devc->channels);
+		break;
 	case SR_CONF_VLD_CH_NUM:
-		*data = g_variant_new_int16(HL_NUM_CHANNELS);
+		/* what the firmware samples now (4 in la48's 4 channel mode) */
+		*data = g_variant_new_int16((int16_t)devc->fw_channels);
+		break;
+	case SR_CONF_CHANNEL_MODE:
+		if (!devc->switchable)
+			return SR_ERR_NA;
+		*data = g_variant_new_int16(devc->fw_channels == 4 ?
+					    HL_MODE_4CH : HL_MODE_8CH);
 		break;
 	case SR_CONF_STREAM:
 		*data = g_variant_new_boolean(TRUE);
@@ -918,6 +1104,8 @@ static int config_set(int id, GVariant *data, struct sr_dev_inst *sdi,
 		break;
 	case SR_CONF_SAMPLERATE:
 		return set_samplerate(devc, g_variant_get_uint64(data));
+	case SR_CONF_CHANNEL_MODE:
+		return set_channel_mode(devc, sdi, g_variant_get_int16(data));
 	case SR_CONF_LIMIT_SAMPLES:
 		v = g_variant_get_uint64(data);
 		if (!v)
@@ -970,12 +1158,25 @@ static int config_list(int key, GVariant **data, const struct sr_dev_inst *sdi,
 	(void)cg;
 	switch (key) {
 	case SR_CONF_DEVICE_OPTIONS:
-		*data = g_variant_new_from_data(G_VARIANT_TYPE("ai"), hwoptions,
-			sizeof(hwoptions), TRUE, NULL, NULL);
+		if (devc && devc->switchable)
+			*data = g_variant_new_from_data(G_VARIANT_TYPE("ai"),
+				hwoptions_la48, sizeof(hwoptions_la48), TRUE, NULL, NULL);
+		else
+			*data = g_variant_new_from_data(G_VARIANT_TYPE("ai"),
+				hwoptions, sizeof(hwoptions), TRUE, NULL, NULL);
 		break;
 	case SR_CONF_DEVICE_SESSIONS:
-		*data = g_variant_new_from_data(G_VARIANT_TYPE("ai"), sessions,
-			sizeof(sessions), TRUE, NULL, NULL);
+		if (devc && devc->switchable)
+			*data = g_variant_new_from_data(G_VARIANT_TYPE("ai"),
+				sessions_la48, sizeof(sessions_la48), TRUE, NULL, NULL);
+		else
+			*data = g_variant_new_from_data(G_VARIANT_TYPE("ai"),
+				sessions, sizeof(sessions), TRUE, NULL, NULL);
+		break;
+	case SR_CONF_CHANNEL_MODE:
+		if (!devc || !devc->switchable)
+			return SR_ERR_ARG;
+		*data = g_variant_new_uint64((uint64_t)(uintptr_t)devc->mode_list);
 		break;
 	case SR_CONF_SAMPLERATE:
 		g_variant_builder_init(&gvb, G_VARIANT_TYPE("a{sv}"));
@@ -1007,7 +1208,8 @@ static int config_list(int key, GVariant **data, const struct sr_dev_inst *sdi,
 /* DSView simple trigger (stage TriggerStages): per channel 'X' don't care,
  * '0'/'1' level, 'R'/'F' edge, 'C' either edge. Disabled channels are
  * ignored, like in the libsigrok driver. */
-static void map_trigger(const struct sr_dev_inst *sdi, struct hl_trigger_spec *t)
+static void map_trigger(const struct hl_context *devc,
+			const struct sr_dev_inst *sdi, struct hl_trigger_spec *t)
 {
 	GSList *l;
 
@@ -1021,6 +1223,14 @@ static void map_trigger(const struct sr_dev_inst *sdi, struct hl_trigger_spec *t
 		if (ch->type != SR_CHANNEL_LOGIC || !ch->enabled ||
 		    ch->index >= HL_NUM_CHANNELS)
 			continue;
+		if (ch->index >= (int)devc->fw_channels) {
+			char c = trigger->trigger0[TriggerStages][ch->index];
+			if (c == '0' || c == '1' || c == 'R' || c == 'F' || c == 'C')
+				sr_warn("Trigger on channel %d ignored: the firmware "
+					"samples %u channels.", ch->index,
+					devc->fw_channels);
+			continue;
+		}
 		m = (uint8_t)(1u << ch->index);
 		switch (trigger->trigger0[TriggerStages][ch->index]) {
 		case '0': t->must_zero |= m; break;
@@ -1046,7 +1256,7 @@ static void refresh_enabled(struct hl_context *devc, const struct sr_dev_inst *s
 		devc->en_bits[n++] = (uint8_t)ch->index;
 	}
 	if (n == 0)
-		for (n = 0; n < HL_NUM_CHANNELS; n++)
+		for (n = 0; n < (int)devc->fw_channels; n++)
 			devc->en_bits[n] = (uint8_t)n;
 	devc->en_count = n;
 }
@@ -1074,7 +1284,11 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 
 	devc->sdi = sdi;
 	refresh_enabled(devc, sdi);
-	map_trigger(sdi, &spec);
+	if (devc->en_count && devc->en_bits[devc->en_count - 1] >= devc->fw_channels)
+		sr_warn("Channels %u..%u are enabled but the firmware samples %u "
+			"channels: they stay low.", devc->fw_channels,
+			devc->channels - 1, devc->fw_channels);
+	map_trigger(devc, sdi, &spec);
 
 	/* LA_CROSS_DATA carries whole groups of 64 samples */
 	total = devc->limit_samples / 64 * 64;
@@ -1141,7 +1355,7 @@ static int hw_dev_acquisition_stop(const struct sr_dev_inst *sdi, void *cb_data)
 
 SR_PRIV struct sr_dev_driver hsdaoh_la_driver_info = {
 	.name = "hsdaoh-la",
-	.longname = "hsdaoh la8 (RP2350 + MS2130 HDMI capture)",
+	.longname = "hsdaoh la8/la4/la48 (RP2350 + MS2130 HDMI capture)",
 	.api_version = 1,
 	.driver_type = DRIVER_TYPE_HARDWARE,
 	.init = hw_init,
