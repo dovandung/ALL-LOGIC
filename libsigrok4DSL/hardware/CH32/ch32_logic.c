@@ -27,6 +27,7 @@
 #include "../../log.h"
 #include "ch32_logic.h"
 #include "ch32_vth_lut.h"
+#include "../common/capture_core.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "ch32: "
@@ -315,6 +316,15 @@ struct ch32_context {
 	/* enabled channel physical bit indices (probe->index) */
 	uint8_t en_bits[CH32_MAX_PHYS_CH];
 	int en_count;
+
+	/*
+	 * Soft trigger (logic mode, not loop, trigger set in the simple
+	 * trigger panel): the samples go through the shared capture core
+	 * (pre-trigger history + capture buffer in host RAM) instead of
+	 * straight to the session; the capture is sent when it is complete.
+	 */
+	int trig_mode;
+	struct hl_capture cap;
 
 	const struct sr_dev_inst *sdi;
 };
@@ -1395,6 +1405,18 @@ static int ch32_convert_push(struct ch32_context *devc,
 	if (ch32_preprocess_append(devc, raw, raw_len) != SR_OK)
 		return SR_ERR_MALLOC;
 
+	if (devc->trig_mode) {
+		/* soft trigger: filtered / decimated samples into the capture
+		 * core; nothing is sent until the capture is complete */
+		if (devc->raw_pending_len > 0)
+			hl_feed_bytes(&devc->cap, devc->raw_pending,
+				      (size_t)devc->raw_pending_len);
+		devc->raw_pending_len = 0;
+		if (devc->cap.state == HL_DONE || devc->cap.state == HL_FAILED)
+			devc->num_samples = devc->limit_samples; /* stop */
+		return devc->cap.state == HL_FAILED ? SR_ERR_MALLOC : SR_OK;
+	}
+
 	groups = devc->raw_pending_len / raw_group;
 	if (groups <= 0)
 		return SR_OK;
@@ -1468,6 +1490,89 @@ static int ch32_convert_push(struct ch32_context *devc,
 	return SR_OK;
 }
 
+/* -------------------- soft trigger: send the capture -------------------- */
+
+#define CH32_SEND_CHUNK		(1024 * 1024)	/* samples per packet, x64 */
+
+/* n samples (cap.unit bytes each) as LA_CROSS_DATA packets */
+static void ch32_send_cross(struct ch32_context *devc, const uint8_t *src,
+			    uint64_t n)
+{
+	struct sr_datafeed_packet packet;
+	struct sr_datafeed_logic logic;
+	const unsigned int unit = devc->cap.unit;
+
+	while (n) {
+		uint64_t k = n < CH32_SEND_CHUNK ? n : CH32_SEND_CHUNK;
+		int bytes = (int)(k / 64 * CH32_CROSS_PLANE_BYTES * devc->en_count);
+
+		if (ch32_ensure_cross_cap(devc, bytes) != SR_OK) {
+			sr_err("Out of memory sending the capture.");
+			return;
+		}
+		hl_to_cross(src, k, devc->en_bits, devc->en_count,
+			    devc->cross_buf, unit);
+		memset(&packet, 0, sizeof(packet));
+		memset(&logic, 0, sizeof(logic));
+		packet.type = SR_DF_LOGIC;
+		packet.status = SR_PKT_OK;
+		packet.payload = &logic;
+		logic.length = (uint64_t)bytes;
+		logic.format = LA_CROSS_DATA;
+		logic.data = devc->cross_buf;
+		ds_data_forward(devc->sdi, &packet);
+		devc->num_bytes += (uint64_t)bytes;
+		src += k * unit;
+		n -= k;
+	}
+}
+
+static void ch32_send_trigger_pos(struct ch32_context *devc, uint64_t index)
+{
+	struct sr_datafeed_packet packet;
+	struct ds_trigger_pos pos;
+
+	memset(&pos, 0, sizeof(pos));
+	pos.status = 1;
+	pos.real_pos = (uint32_t)index;
+	memset(&packet, 0, sizeof(packet));
+	packet.type = SR_DF_TRIGGER;
+	packet.status = SR_PKT_OK;
+	packet.payload = &pos;
+	ds_data_forward(devc->sdi, &packet);
+}
+
+/*
+ * Send what the capture core collected: pre-trigger part, trigger marker,
+ * the rest (whole groups of 64 samples). Complete captures, and captures
+ * stopped after the trigger; nothing if the trigger never came.
+ */
+static void ch32_send_capture(struct ch32_context *devc)
+{
+	struct hl_capture *c = &devc->cap;
+	int state = c->state;
+	uint64_t total, pre;
+
+	c->state = HL_IDLE;
+	if (state != HL_DONE && state != HL_CAPTURING) {
+		sr_info("Soft trigger: no trigger before the end of the acquisition.");
+		return;
+	}
+	total = c->buf_fill / 64 * 64;
+	pre = c->trigger_pos / 64 * 64;
+	if (!total)
+		return;
+	if (pre > total)
+		pre = total;
+	if (state != HL_DONE)
+		sr_info("Soft trigger: stopped, sending %" PRIu64 " samples.", total);
+	ch32_send_cross(devc, c->buf, pre);
+	if (c->have_trigger)
+		ch32_send_trigger_pos(devc, c->trigger_pos);
+	ch32_send_cross(devc, c->buf + pre * c->unit, total - pre);
+	devc->num_samples = total;
+}
+
 /* -------------------- transfer path -------------------- */
 
 static void finish_acquisition(struct ch32_context *devc)
@@ -1487,6 +1592,12 @@ static void finish_acquisition(struct ch32_context *devc)
 	 * are nested inside libusb_handle_events.
 	 */
 	ch32_hw_stop(devc);
+
+	if (devc->trig_mode) {
+		ch32_send_capture(devc);
+		hl_free_buffers(&devc->cap);
+		devc->trig_mode = 0;
+	}
 
 	sr_info("send SR_DF_END, samples=%" PRIu64, devc->num_samples);
 	packet.type = SR_DF_END;
@@ -1893,6 +2004,7 @@ static int hw_dev_destroy(struct sr_dev_inst *sdi)
 		g_free(devc->cross_buf);
 		g_free(devc->decim_win);
 		g_free(devc->analog_expand);
+		hl_free(&devc->cap);
 		g_free(devc);
 		sdi->priv = NULL;
 	}
@@ -2047,6 +2159,11 @@ static int config_get(int id, GVariant **data, const struct sr_dev_inst *sdi,
 	case SR_CONF_STREAM:
 		/* Continuous USB stream (required for UI Loop/rolling) */
 		*data = g_variant_new_boolean(TRUE);
+		break;
+	case SR_CONF_CAPTURE_RATIO:
+		/* soft trigger: the pre-trigger samples are kept in host RAM,
+		 * so the trigger position is free (enables DSView's slider) */
+		*data = g_variant_new_uint64(trigger ? ds_trigger_get_pos() : 0);
 		break;
 	case SR_CONF_VTH:
 		*data = g_variant_new_double(devc->vth);
@@ -2349,6 +2466,83 @@ static int config_list(int key, GVariant **data, const struct sr_dev_inst *sdi,
 	return SR_OK;
 }
 
+/* DSView simple trigger (stage TriggerStages): per channel '0'/'1' level,
+ * 'R'/'F' edge, 'C' either edge; disabled channels are ignored. */
+static void ch32_map_trigger(const struct sr_dev_inst *sdi,
+			     const struct ch32_context *devc,
+			     struct hl_trigger_spec *t)
+{
+	GSList *l;
+	int max_bit = (devc->logic_bit == 8) ? 8 : 16;
+
+	memset(t, 0, sizeof(*t));
+	if (!trigger || !trigger->trigger_en)
+		return;
+	for (l = sdi->channels; l; l = l->next) {
+		struct sr_channel *ch = l->data;
+		uint16_t m;
+
+		if (ch->type != SR_CHANNEL_LOGIC || !ch->enabled ||
+		    ch->index >= max_bit)
+			continue;
+		m = (uint16_t)(1u << ch->index);
+		switch (trigger->trigger0[TriggerStages][ch->index]) {
+		case '0': t->must_zero |= m; break;
+		case '1': t->must_one |= m; break;
+		case 'R': t->rising |= m; break;
+		case 'F': t->falling |= m; break;
+		case 'C': t->edge |= m; break;
+		default: break;
+		}
+	}
+}
+
+/*
+ * Set up the soft trigger for a logic acquisition. Returns SR_OK with
+ * trig_mode 0 when there is no trigger (plain streaming, as before).
+ */
+static int ch32_setup_soft_trigger(struct sr_dev_inst *sdi,
+				   struct ch32_context *devc)
+{
+	struct hl_trigger_spec spec;
+	uint64_t total, pre, post;
+	int ret;
+
+	devc->trig_mode = 0;
+	ch32_map_trigger(sdi, devc, &spec);
+	ret = hl_build_trigger(&devc->cap, &spec);
+	if (ret < 0)
+		return SR_ERR_MALLOC;
+	if (ret == 0)
+		return SR_OK;
+	if (devc->is_loop) {
+		sr_warn("Soft trigger ignored in loop mode.");
+		return SR_OK;
+	}
+
+	/* LA_CROSS_DATA carries whole groups of 64 samples */
+	total = devc->limit_samples / 64 * 64;
+	if (total < 64)
+		total = 64;
+	pre = total * ds_trigger_get_pos() / 100;
+	post = total - pre;
+	if (!post) {
+		post = 1;
+		pre = total - 1;
+	}
+	if (hl_alloc(&devc->cap, pre, post,
+		     devc->logic_bit == 8 ? 1 : 2) != 0) {
+		sr_err("Not enough memory for a %" PRIu64 " sample capture.", total);
+		ds_set_last_error(SR_ERR_MALLOC);
+		return SR_ERR_MALLOC;
+	}
+	hl_reset(&devc->cap);
+	devc->trig_mode = 1;
+	sr_info("Soft trigger: waiting for the trigger, then %" PRIu64 " + %"
+		PRIu64 " samples.", pre, post);
+	return SR_OK;
+}
+
 static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 {
 	struct ch32_context *devc = sdi->priv;
@@ -2377,6 +2571,7 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 	devc->stream_res_len = 0;
 	devc->decim_win_fill = 0;
 	devc->acq_analog = (sdi->mode == ANALOG) ? 1 : 0;
+	devc->trig_mode = 0;
 	/* residual half-sample only used on analog EP3 path */
 
 	if (devc->acq_analog) {
@@ -2426,10 +2621,16 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 			return ret;
 		if ((ret = ch32_apply_level(devc)) != SR_OK)
 			return ret;
+		if ((ret = ch32_setup_soft_trigger(sdi, devc)) != SR_OK)
+			return ret;
 	}
 
 	if ((ret = start_transfers(devc)) != SR_OK) {
 		sr_err("start_transfers failed");
+		if (devc->trig_mode) {
+			hl_free_buffers(&devc->cap);
+			devc->trig_mode = 0;
+		}
 		return ret;
 	}
 
