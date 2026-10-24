@@ -312,6 +312,64 @@ static void process(struct hl_capture *c, const uint8_t *s, size_t n)
 	}
 }
 
+/* la4 unpacking: byte -> its two nibbles, high nibble (earlier sample)
+ * first, as a little-endian 16-bit value */
+static uint16_t nibble_tbl[256];
+
+static void nibble_tbl_init(void)
+{
+	unsigned int b;
+
+	if (nibble_tbl[0x10])
+		return;
+	for (b = 0; b < 256; b++)
+		nibble_tbl[b] = (uint16_t)((b >> 4) | ((b & 0x0f) << 8));
+}
+
+/*
+ * Unpack `words` 16-bit link words (little endian) to one byte per sample:
+ * spw 2 (la8): high byte = earlier sample; spw 4 (la4): bits 15:12 first.
+ * As in the libsigrok hsdaoh-la driver.
+ */
+static void unpack_words(uint8_t *dst, const uint8_t *src, size_t words,
+			 unsigned int spw)
+{
+	size_t w = 0;
+
+	if (spw == 4) {
+		if (little_endian()) {
+			/* 2 table lookups and one 32-bit store per word */
+			nibble_tbl_init();
+			for (; w < words; w++) {
+				uint32_t v = (uint32_t)nibble_tbl[src[2 * w + 1]] |
+					((uint32_t)nibble_tbl[src[2 * w]] << 16);
+				memcpy(dst + 4 * w, &v, 4);
+			}
+			return;
+		}
+		for (; w < words; w++) {
+			uint8_t hi = src[2 * w + 1], lo = src[2 * w];
+			dst[4 * w] = hi >> 4;
+			dst[4 * w + 1] = hi & 0x0f;
+			dst[4 * w + 2] = lo >> 4;
+			dst[4 * w + 3] = lo & 0x0f;
+		}
+		return;
+	}
+	/* la8: swap the two bytes of every word, 4 words at a time (the swap
+	 * within 16-bit lanes does not depend on the byte order) */
+	for (; w + 4 <= words; w += 4) {
+		uint64_t v = load_u64(src + 2 * w);
+		v = ((v >> 8) & UINT64_C(0x00ff00ff00ff00ff)) |
+		    ((v << 8) & UINT64_C(0xff00ff00ff00ff00));
+		memcpy(dst + 2 * w, &v, 8);
+	}
+	for (; w < words; w++) {
+		dst[2 * w] = src[2 * w + 1];
+		dst[2 * w + 1] = src[2 * w];
+	}
+}
+
 int hl_feed(struct hl_capture *c, const uint8_t *buf, size_t words,
 	    uint64_t data_cnt)
 {
@@ -321,7 +379,7 @@ int hl_feed(struct hl_capture *c, const uint8_t *buf, size_t words,
 int hl_feed_spw(struct hl_capture *c, const uint8_t *buf, size_t words,
 		uint64_t data_cnt, unsigned int spw)
 {
-	size_t n, w;
+	size_t n;
 	int lost = 0;
 
 	if (c->state != HL_ARMED && c->state != HL_CAPTURING)
@@ -344,6 +402,33 @@ int hl_feed_spw(struct hl_capture *c, const uint8_t *buf, size_t words,
 	c->next_cnt = data_cnt + words;
 	c->cnt_valid = 1;
 
+	/*
+	 * Capturing (after the trigger): unpack straight into the capture
+	 * buffer, no intermediate copy. Whole words only; when the capture
+	 * ends inside a word, that word is unpacked separately.
+	 */
+	if (c->state == HL_CAPTURING) {
+		uint64_t need = c->trigger_pos + c->post - c->buf_fill;
+		size_t direct = (size_t)HL_MIN((uint64_t)words, need / spw);
+		uint8_t last[4];
+
+		unpack_words(c->buf + c->buf_fill, buf, direct, spw);
+		c->buf_fill += (uint64_t)direct * spw;
+		if (c->buf_fill >= c->trigger_pos + c->post) {
+			c->state = HL_DONE;
+			return lost;
+		}
+		if (direct == words)
+			return lost;
+		unpack_words(last, buf + 2 * direct, 1, spw);
+		need = c->trigger_pos + c->post - c->buf_fill;
+		memcpy(c->buf + c->buf_fill, last, (size_t)need);
+		c->buf_fill += need;
+		c->state = HL_DONE;
+		return lost;
+	}
+
+	/* waiting for the trigger: unpack, then search and keep the history */
 	n = words * spw;
 	if (n > c->unpack_size) {
 		free(c->unpack);
@@ -354,24 +439,7 @@ int hl_feed_spw(struct hl_capture *c, const uint8_t *buf, size_t words,
 			return -1;
 		}
 	}
-	if (spw == 4) {
-		/* la4: four 4-bit samples per word, the earliest in bits 15:12;
-		 * the words arrive little endian */
-		for (w = 0; w < words; w++) {
-			uint8_t hi = buf[2 * w + 1], lo = buf[2 * w];
-			c->unpack[4 * w] = hi >> 4;
-			c->unpack[4 * w + 1] = hi & 0x0f;
-			c->unpack[4 * w + 2] = lo >> 4;
-			c->unpack[4 * w + 3] = lo & 0x0f;
-		}
-	} else {
-		/* la8: two samples per 16-bit word, the earlier one in the high
-		 * byte; the words arrive little endian: swap the bytes */
-		for (w = 0; w < words; w++) {
-			c->unpack[2 * w] = buf[2 * w + 1];
-			c->unpack[2 * w + 1] = buf[2 * w];
-		}
-	}
+	unpack_words(c->unpack, buf, words, spw);
 	process(c, c->unpack, n);
 	return lost;
 }
