@@ -189,7 +189,8 @@ static const uint64_t ch32_vdivs[] = {
 	SR_mV(500), SR_V(1), SR_V(2), 0,
 };
 
-static const char *ch32_coupling[] = { "DC", "AC", NULL };
+/* the HSADC input is DC coupled: no AC option */
+static const uint8_t ch32_coupling[] = { SR_DC_COUPLING };
 static const char *ch32_map_units[] = { "V", NULL };
 
 enum {
@@ -2436,14 +2437,29 @@ static int config_list(int key, GVariant **data, const struct sr_dev_inst *sdi,
 			ARRAY_SIZE(ch32_probe_options) * sizeof(int32_t),
 			TRUE, NULL, NULL);
 		break;
+	/*
+	 * DSView's probe options read these two as dictionaries
+	 * ({"vdivs": at} and {"coupling": ay}, as the DSLogic driver sends
+	 * them). A plain array here made Device Options crash in Data
+	 * Acquisition mode with a GLib built without checks.
+	 */
 	case SR_CONF_PROBE_VDIV:
-		*data = g_variant_new_from_data(
+		g_variant_builder_init(&gvb, G_VARIANT_TYPE("a{sv}"));
+		gvar = g_variant_new_from_data(
 			G_VARIANT_TYPE("at"), ch32_vdivs,
 			(ARRAY_SIZE(ch32_vdivs) - 1) * sizeof(uint64_t),
 			TRUE, NULL, NULL);
+		g_variant_builder_add(&gvb, "{sv}", "vdivs", gvar);
+		*data = g_variant_builder_end(&gvb);
 		break;
 	case SR_CONF_PROBE_COUPLING:
-		*data = g_variant_new_strv(ch32_coupling, 2);
+		g_variant_builder_init(&gvb, G_VARIANT_TYPE("a{sv}"));
+		gvar = g_variant_new_from_data(
+			G_VARIANT_TYPE("ay"), ch32_coupling,
+			ARRAY_SIZE(ch32_coupling) * sizeof(uint8_t),
+			TRUE, NULL, NULL);
+		g_variant_builder_add(&gvb, "{sv}", "coupling", gvar);
+		*data = g_variant_builder_end(&gvb);
 		break;
 	case SR_CONF_PROBE_MAP_UNIT:
 		*data = g_variant_new_strv(ch32_map_units, 1);
