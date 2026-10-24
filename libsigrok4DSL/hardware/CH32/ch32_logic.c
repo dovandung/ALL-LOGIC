@@ -1187,6 +1187,21 @@ static int ch32_preprocess_append(struct ch32_context *devc,
 	if (!raw || raw_len <= 0)
 		return SR_OK;
 
+	/*
+	 * Fast path, no filter and no decimation: the samples are taken as
+	 * they are. raw_pending is consumed in whole 64-sample groups (bytes),
+	 * so a sample split between two transfers simply waits there.
+	 */
+	if (devc->filter != SR_FILTER_1T && devc->decimate_n <= 1 &&
+	    devc->stream_res_len == 0) {
+		if (ch32_ensure_pending_cap(devc,
+			devc->raw_pending_len + raw_len) != SR_OK)
+			return SR_ERR_MALLOC;
+		memcpy(devc->raw_pending + devc->raw_pending_len, raw, raw_len);
+		devc->raw_pending_len += raw_len;
+		return SR_OK;
+	}
+
 	/* Merge stream residual (half sample from previous URB). */
 	if (devc->stream_res_len > 0) {
 		int need = sample_bytes - devc->stream_res_len;
@@ -1392,7 +1407,7 @@ static int ch32_convert_push(struct ch32_context *devc,
 	const int en = devc->en_count;
 	const int raw_group = CH32_CROSS_SCALE * sample_bytes;
 	const int cross_group = CH32_CROSS_PLANE_BYTES * en;
-	int groups, g, c, i, consumed, left;
+	int groups, consumed, left;
 	uint8_t *out;
 	int out_len;
 	struct sr_datafeed_packet packet;
@@ -1401,6 +1416,16 @@ static int ch32_convert_push(struct ch32_context *devc,
 
 	if (en < 1 || raw_len <= 0)
 		return SR_OK;
+
+	if (devc->trig_mode && devc->filter != SR_FILTER_1T &&
+	    devc->decimate_n <= 1) {
+		/* soft trigger, no filter / decimation: straight into the
+		 * capture core (it joins 16-bit samples split by transfers) */
+		hl_feed_bytes(&devc->cap, raw, (size_t)raw_len);
+		if (devc->cap.state == HL_DONE || devc->cap.state == HL_FAILED)
+			devc->num_samples = devc->limit_samples; /* stop */
+		return devc->cap.state == HL_FAILED ? SR_ERR_MALLOC : SR_OK;
+	}
 
 	if (ch32_preprocess_append(devc, raw, raw_len) != SR_OK)
 		return SR_ERR_MALLOC;
@@ -1442,29 +1467,11 @@ static int ch32_convert_push(struct ch32_context *devc,
 	if (ch32_ensure_cross_cap(devc, out_len) != SR_OK)
 		return SR_ERR_MALLOC;
 
+	/* 8x8 bit transposes (shared with the other drivers) instead of
+	 * one bit at a time; same LA_CROSS_DATA layout */
 	out = devc->cross_buf;
-	for (g = 0; g < groups; g++) {
-		const uint8_t *blk = devc->raw_pending + g * raw_group;
-		for (c = 0; c < en; c++) {
-			uint64_t plane = 0;
-			uint8_t bit = devc->en_bits[c];
-			for (i = 0; i < CH32_CROSS_SCALE; i++) {
-				uint16_t s = ch32_load_sample(
-					blk + i * sample_bytes, sample_bytes);
-				if ((s >> bit) & 1u)
-					plane |= (1ULL << i);
-			}
-			out[0] = (uint8_t)(plane);
-			out[1] = (uint8_t)(plane >> 8);
-			out[2] = (uint8_t)(plane >> 16);
-			out[3] = (uint8_t)(plane >> 24);
-			out[4] = (uint8_t)(plane >> 32);
-			out[5] = (uint8_t)(plane >> 40);
-			out[6] = (uint8_t)(plane >> 48);
-			out[7] = (uint8_t)(plane >> 56);
-			out += CH32_CROSS_PLANE_BYTES;
-		}
-	}
+	hl_to_cross(devc->raw_pending, (uint64_t)groups * CH32_CROSS_SCALE,
+		    devc->en_bits, en, out, (unsigned int)sample_bytes);
 
 	samples_out = (uint64_t)groups * CH32_CROSS_SCALE;
 
