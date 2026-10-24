@@ -656,7 +656,13 @@ endif()
 add_definitions(${QT_DEFINITIONS})
 add_definitions(-Wall -Wextra -Wno-return-type -Wno-ignored-qualifiers)
 # libsigrok4DSL/config.h is gitignored; keep community drivers on in CMake.
+# DSLogic/DSCope, WCH CH32 (CH32H417, 1A86:5537/5538) and PX-Logic: their
+# sources are compiled above, but the HAVE_* flags lived only in the
+# gitignored config.h, so the drivers were never registered.
 add_definitions(
+	-DHAVE_DSL_DEVICE=1
+	-DHAVE_CH32_DEVICE=1
+	-DHAVE_PXLOGIC_DEVICE=1
 	-DHAVE_ATKLOGIC_DEVICE=1
 	-DHAVE_FX2LAFW_DEVICE=1
 	-DHAVE_SLOGIC_DEVICE=1
