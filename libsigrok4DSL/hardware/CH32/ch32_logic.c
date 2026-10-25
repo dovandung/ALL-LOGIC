@@ -141,11 +141,27 @@ static const struct ch32_samplerate_entry ch32_hw_rates[] = {
 };
 
 /*
+ * 8 channel rates above 200 MS/s (USB3 only): firmware version 3 and later
+ * (SOFTWARE_VERSION 0x03, logic_sys 0x18..0x1B: PLL 450..600 MHz / 2).
+ * Older firmware treats these codes as its 100 MS/s default, so they are
+ * only offered when the firmware reports version 3 or later.
+ */
+#define CH32_FW_FAST8_VERSION	3
+static const struct ch32_samplerate_entry ch32_fast8_rates[] = {
+	{ 0x18, SR_MHZ(300) },
+	{ 0x19, SR_MHZ(275) },
+	{ 0x1a, SR_MHZ(250) },
+	{ 0x1b, SR_MHZ(225) },
+};
+
+/*
  * UI sample-rate list only: common integer MHz (high → low).
  * Odd HW PLL rates (187.5 / 156.25 / …) stay in ch32_hw_rates for
  * mapping, but are not shown in the combobox.
  */
 static const uint64_t ch32_ui_rates[] = {
+	SR_MHZ(300),	/* 8 channels, firmware >= 3, USB3 */
+	SR_MHZ(250),	/* idem */
 	SR_MHZ(200),
 	SR_MHZ(100),
 	SR_MHZ(50),
@@ -358,8 +374,17 @@ static int ch32_is_usb3_link(const struct ch32_context *devc)
  *   16-bit → DIV20 @ 400M ≈ 20 MS/s
  * USB3 uses full programmable rate table (up to 200 MS/s).
  */
+/* 8 channel rates above 200 MS/s available (USB3, 8 ch, firmware >= 3) */
+static int ch32_fast8_ok(const struct ch32_context *devc)
+{
+	return devc && devc->logic_bit == 8 &&
+	       devc->sw_ver >= CH32_FW_FAST8_VERSION && ch32_is_usb3_link(devc);
+}
+
 static uint64_t ch32_link_max_hw_rate(const struct ch32_context *devc)
 {
+	if (ch32_fast8_ok(devc))
+		return ch32_fast8_rates[0].rate; /* 300M */
 	if (ch32_is_usb3_link(devc))
 		return ch32_hw_rates[0].rate; /* 200M */
 	if (devc && devc->logic_bit == 8)
@@ -510,10 +535,21 @@ static void ch32_map_samplerate(struct ch32_context *devc, uint64_t want)
 		return;
 	}
 
-	/* USB3: try every firmware rate × integer N */
-	for (i = 0; i < ARRAY_SIZE(ch32_hw_rates); i++) {
-		uint64_t hw = ch32_hw_rates[i].rate;
+	/* USB3: try every firmware rate × integer N (the 8 channel rates
+	 * above 200 MS/s first, when the firmware has them) */
+	for (i = 0; i < ARRAY_SIZE(ch32_fast8_rates) + ARRAY_SIZE(ch32_hw_rates); i++) {
+		const struct ch32_samplerate_entry *ent;
+		uint64_t hw;
 		int max_n, n;
+
+		if (i < ARRAY_SIZE(ch32_fast8_rates)) {
+			if (!ch32_fast8_ok(devc))
+				continue;
+			ent = &ch32_fast8_rates[i];
+		} else {
+			ent = &ch32_hw_rates[i - ARRAY_SIZE(ch32_fast8_rates)];
+		}
+		hw = ent->rate;
 
 		if (hw > link_max || hw < CH32_UI_RATE_MIN)
 			continue;
@@ -560,7 +596,7 @@ static void ch32_map_samplerate(struct ch32_context *devc, uint64_t want)
 					best_n = n;
 					best_hw = hw;
 					best_eff = eff;
-					best_sys = ch32_hw_rates[i].logic_sys;
+					best_sys = ent->logic_sys;
 				}
 			}
 			/* N=1 always considered for exact hardware match */
@@ -576,7 +612,7 @@ static void ch32_map_samplerate(struct ch32_context *devc, uint64_t want)
 					best_n = 1;
 					best_hw = hw;
 					best_eff = eff;
-					best_sys = ch32_hw_rates[i].logic_sys;
+					best_sys = ent->logic_sys;
 				}
 			}
 		}
