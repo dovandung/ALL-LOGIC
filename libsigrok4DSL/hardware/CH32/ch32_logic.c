@@ -142,7 +142,8 @@ static const struct ch32_samplerate_entry ch32_hw_rates[] = {
 
 /*
  * 8 channel rates above 200 MS/s (USB3 only): firmware version 3 and later
- * (SOFTWARE_VERSION 0x03, logic_sys 0x18..0x1B: PLL 450..600 MHz / 2).
+ * (SOFTWARE_VERSION 0x03, logic_sys 0x18..0x1B: PLL 300 / 275 / 250 /
+ * 225 MHz with the UHSIF clock undivided, DIV1).
  * Older firmware treats these codes as its 100 MS/s default, so they are
  * only offered when the firmware reports version 3 or later.
  */
