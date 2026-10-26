@@ -502,6 +502,8 @@ set(libsigrok4DSL_SOURCES
     libsigrok4DSL/hardware/common/ezusb.c
     libsigrok4DSL/hardware/common/capture_core.c
     libsigrok4DSL/hardware/cypress-fx3/cypress_fx3.c
+    libsigrok4DSL/hardware/alientek-dl32/dl32.c
+    libsigrok4DSL/hardware/alientek-dl32/dl32_protocol.c
     libsigrok4DSL/trigger.c
     libsigrok4DSL/dsdevice.c
     libsigrok4DSL/hardware/DSL/dscope.c
@@ -667,6 +669,7 @@ add_definitions(
 	-DHAVE_FX2LAFW_DEVICE=1
 	-DHAVE_SLOGIC_DEVICE=1
 	-DHAVE_CYPRESS_FX3_DEVICE=1
+	-DHAVE_ALIENTEK_DL32_DEVICE=1
 )
 
 if(NOT DISABLE_WERROR)
