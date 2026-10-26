@@ -33,7 +33,10 @@
  *     byte, LSB first; that is already ALL LOGIC's LA_CROSS_DATA plane
  *     layout, so stream data is copied 8 bytes per channel and 64 samples
  *     instead of being interleaved
- *   - RLE capture is not offered (the protocol code supports it)
+ *   - RLE: in Buffer Mode, the way ALL LOGIC does it for DSLogic: sample
+ *     counts beyond the device memory are marked "(RLE)" and turn RLE on;
+ *     if the compressed data still does not fit, the device reports it and
+ *     the capture is shown as long as all channels have data
  */
 
 #include <inttypes.h>
@@ -55,6 +58,12 @@
  */
 #define DL32_MEM_PLUS		(UINT64_C(3500) * SR_MHZ(1))
 #define DL32_MEM		(UINT64_C(1000) * SR_MHZ(1))
+
+/*
+ * With RLE ATK-Logic offers up to 10x the memory (marked as maybe not
+ * fitting); ALL LOGIC offers RLE counts up to 1024x, so longer RLE captures
+ * may end early (shown with the actual length).
+ */
 
 /* samples per LA_CROSS_DATA packet when sending a buffer capture (x 64) */
 #define DL32_SEND_CHUNK		(1024 * 1024)
@@ -94,6 +103,7 @@ struct dl32_context {
 	uint64_t samplerate;
 	uint64_t limit_samples;
 	double vth;
+	gboolean rle;			/* RLE asked for (Buffer Mode only) */
 	int op_mode;			/* LO_OP_STREAM / LO_OP_BUFFER */
 	int max_height;
 
@@ -103,6 +113,8 @@ struct dl32_context {
 	gboolean data_started;
 	gboolean buffer_mode;
 	gboolean framed;
+	gboolean rle_active;		/* this capture uses RLE */
+	uint64_t actual_samples;	/* samples sent by the last capture */
 	gboolean hw_trigger;
 	gboolean trig_sent;
 	struct libusb_transfer **transfers;
@@ -371,6 +383,10 @@ static void flush_capture(struct dl32_context *devc)
 	    devc->pre_trigger < count)
 		send_trigger_pos(devc, devc->pre_trigger);
 
+	if (devc->rle_active && count < devc->acq_limit)
+		sr_warn("RLE capture: %" PRIu64 " of %" PRIu64 " samples fit in "
+			"the device memory.", count, devc->acq_limit);
+
 	for (pos = 0; pos < count; pos += n) {
 		n = MIN((uint64_t)DL32_SEND_CHUNK, count - pos);
 		render_cross(devc, &plan, pos, n / 64, devc->cross_buf);
@@ -527,6 +543,7 @@ static void finish_acquisition(struct dl32_context *devc)
 	packet.status = SR_PKT_OK;
 	ds_data_forward(devc->sdi, &packet);
 	sr_info("Acquisition done, %" PRIu64 " samples sent.", devc->sent_samples);
+	devc->actual_samples = devc->sent_samples;
 
 	devc->running = FALSE;
 	free_acquisition(devc);
@@ -838,8 +855,15 @@ static int config_get(int id, GVariant **data, const struct sr_dev_inst *sdi,
 		*data = g_variant_new_boolean(TRUE);
 		break;
 	case SR_CONF_RLE:
+		*data = g_variant_new_boolean(devc->rle && devc->op_mode == LO_OP_BUFFER);
+		break;
 	case SR_CONF_RLE_SUPPORT:
-		*data = g_variant_new_boolean(FALSE);
+		/* lets ALL LOGIC offer "(RLE)" sample counts in Buffer Mode */
+		*data = g_variant_new_boolean(devc->op_mode == LO_OP_BUFFER);
+		break;
+	case SR_CONF_ACTUAL_SAMPLES:
+		*data = g_variant_new_uint64(devc->actual_samples ?
+			devc->actual_samples : devc->limit_samples);
 		break;
 	default:
 		return SR_ERR_NA;
@@ -903,6 +927,9 @@ static int config_set(int id, GVariant *data, struct sr_dev_inst *sdi,
 		devc->max_height = g_variant_get_byte(data);
 		if (devc->max_height > 4)
 			devc->max_height = 4;
+		break;
+	case SR_CONF_RLE:
+		devc->rle = g_variant_get_boolean(data);
 		break;
 	case SR_CONF_LOOP_MODE:
 		break;
@@ -986,7 +1013,10 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 	devc->acq_limit = limit;
 	devc->buffer_mode = devc->op_mode == LO_OP_BUFFER ||
 		devc->samplerate > DL32_MAX_STREAM_RATE;
-	devc->framed = devc->buffer_mode;	/* no RLE */
+	devc->framed = devc->buffer_mode;
+	/* RLE in Buffer Mode (ALL LOGIC turns it on for "(RLE)" counts) */
+	devc->rle_active = devc->buffer_mode && devc->rle;
+	devc->actual_samples = 0;
 
 	refresh_enabled(devc, sdi);
 	/* captured device channels: stream mode always sends all of them */
@@ -1053,7 +1083,7 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 	devc->cross_buf = g_try_malloc(MAX((size_t)DL32_SEND_CHUNK / 64,
 		(size_t)DL32_BLOCK_BYTES / 8) * 8 * DL32_TRIGGER_POSITIONS);
 	devc->pending = g_byte_array_new();
-	devc->capture = dl32_capture_new(FALSE);
+	devc->capture = dl32_capture_new(devc->rle_active);
 	if (!devc->group_buf || !devc->cross_buf) {
 		free_acquisition(devc);
 		ds_set_last_error(SR_ERR_MALLOC);
@@ -1064,7 +1094,7 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 	devc->aborted = FALSE;
 	devc->data_started = FALSE;
 
-	dl32_build_params(params, devc->buffer_mode, FALSE,
+	dl32_build_params(params, devc->buffer_mode, devc->rle_active,
 			  (int)floor(devc->vth * 10.0 + 0.5), hz_index,
 			  device_samples, trigger_pos);
 	dl32_build_trigger(trig, codes, devc->num_channels, devc->ch_offset);
@@ -1076,10 +1106,10 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 		trig[DL32_TRIGGER_INSTANT] = 1;
 	{
 		char ph[64], th[80];
-		sr_info("Starting %s mode: %" PRIu64 " Hz, %" PRIu64 " device "
+		sr_info("Starting %s mode%s: %" PRIu64 " Hz, %" PRIu64 " device "
 			"samples, %" PRIu64 " to show, %s trigger, %d channels shown, "
 			"threshold %.1f V.", devc->buffer_mode ? "buffer" : "stream",
-			devc->samplerate, device_samples, limit,
+			devc->rle_active ? " (RLE)" : "", devc->samplerate, device_samples, limit,
 			devc->hw_trigger ? "hardware" : "no", devc->en_count, devc->vth);
 		sr_dbg("Params: %s", dl32_hex(ph, sizeof(ph), params, sizeof(params)));
 		sr_dbg("Trigger: %s", dl32_hex(th, sizeof(th), trig, sizeof(trig)));

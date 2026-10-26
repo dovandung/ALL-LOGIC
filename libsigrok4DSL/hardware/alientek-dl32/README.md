@@ -36,6 +36,16 @@ DL32 hello exchange before it is listed).
   units). ATK-Logic's presets: 5.0 V CMOS 2.5 V, 3.3 V CMOS 1.6 V (the
   default), 3.0 V CMOS 1.5 V, 2.5 V CMOS 1.2 V, 1.8 V CMOS 0.9 V, 1.5 V
   CMOS 0.7 V, 1.2 V CMOS 0.6 V.
+- **RLE (Buffer Mode):** handled the way ALL LOGIC does it for DSLogic.
+  With Buffer Mode selected, the sample count list goes past the device
+  memory with entries marked "(RLE)"; choosing one turns RLE on, and the
+  device then sends run-length coded data (pairs of count and byte). If the
+  coded data still does not fit, the device reports it, the channels are
+  aligned on the shortest one and ALL LOGIC is told the actual length (the
+  log says how many samples fit). ATK-Logic offers RLE up to 10 times the
+  memory; ALL LOGIC's list goes further, so the longest RLE counts may end
+  early. RLE is not used in Stream Mode, where ALL LOGIC's sample count
+  list never selects it.
 - **Environment:** `ALIENTEK_DL32_OFFSET=<n>` shows a 16 channel window
   from CH`n` (even, at most 16); `ALIENTEK_DL32_DEBUG=1` adds hex dumps of
   the commands and frames to the log.
@@ -49,7 +59,8 @@ Mode data is cut out of each channel's stream at the trimmed start.
 
 ## Not ported
 
-- RLE capture (the protocol code handles it; not offered in ALL LOGIC)
+- RLE in Stream Mode (the libsigrok driver allows it; ALL LOGIC's sample
+  count list turns RLE off whenever Stream Mode is used)
 - libsigrok's software trigger fallback (ALL LOGIC's simple trigger always
   fits the hardware trigger)
 - the `ALIENTEK_DL32_DUMP` raw dump file
