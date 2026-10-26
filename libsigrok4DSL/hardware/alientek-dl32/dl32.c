@@ -90,6 +90,17 @@ static const struct sr_list_item opmode_list[] = {
 	{ -1, NULL },
 };
 
+static const char *dl32_speed_name(int speed)
+{
+	switch (speed) {
+	case LIBUSB_SPEED_FULL: return "1.1 (full speed)";
+	case LIBUSB_SPEED_HIGH: return "2.0 (high speed)";
+	case LIBUSB_SPEED_SUPER: return "3.0 (SuperSpeed)";
+	case LIBUSB_SPEED_SUPER_PLUS: return "3.x (SuperSpeed+)";
+	default: return "speed unknown";
+	}
+}
+
 struct dl32_context {
 	const struct sr_dev_inst *sdi;
 	struct sr_context *sr_ctx;
@@ -702,10 +713,11 @@ static GSList *hw_scan(GSList *options)
 			sdi->channels = g_slist_append(sdi->channels,
 				sr_channel_new((uint16_t)j, SR_CHANNEL_LOGIC, TRUE, name));
 		}
-		sr_info("Found ALIENTEK %s%s, MCU %d.%d, %u channels%s.", info.name,
-			info.plus ? " Plus" : "", info.mcu_version / 10,
+		sr_info("Found ALIENTEK %s%s, MCU %d.%d, %u channels%s, USB %s.",
+			info.name, info.plus ? " Plus" : "", info.mcu_version / 10,
 			info.mcu_version % 10, nch,
-			devc->ch_offset ? " (offset window)" : "");
+			devc->ch_offset ? " (offset window)" : "",
+			dl32_speed_name(libusb_get_device_speed(devc->usb_dev)));
 		devices = g_slist_append(devices, sdi);
 	}
 	libusb_free_device_list(devlist, 0);
@@ -853,6 +865,13 @@ static int config_get(int id, GVariant **data, const struct sr_dev_inst *sdi,
 		break;
 	case SR_CONF_USB30_SUPPORT:
 		*data = g_variant_new_boolean(TRUE);
+		break;
+	case SR_CONF_USB_SPEED:
+		/* Actual link speed; without it ALL LOGIC assumes USB 2.0. */
+		if (!devc->usb_dev)
+			return SR_ERR;
+		*data = g_variant_new_int32(
+			(int32_t)libusb_get_device_speed(devc->usb_dev));
 		break;
 	case SR_CONF_RLE:
 		*data = g_variant_new_boolean(devc->rle && devc->op_mode == LO_OP_BUFFER);
