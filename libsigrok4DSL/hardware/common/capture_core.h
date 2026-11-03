@@ -58,12 +58,9 @@ struct hl_trigger_spec {
 };
 
 struct hl_capture {
-	/* trigger: tbl[(prev << 8) | cur] != 0 where the conditions on
-	 * channels 0..7 are met; trig_tbl_hi the same for channels 8..15
-	 * (NULL when none of them is used) */
+	/* trigger conditions (see find_trigger in capture_core.c) */
 	int have_trigger;
-	uint8_t *trig_tbl;
-	uint8_t *trig_tbl_hi;
+	struct hl_trigger_spec trig;
 	unsigned int unit;	/* bytes per sample: 1 or 2 */
 
 	int state;
@@ -86,8 +83,9 @@ struct hl_capture {
 	int carry_len;
 };
 
-/* Build the trigger lookup table. Returns 0 (no trigger needed), 1 (trigger
- * armed) or -1 (out of memory). */
+/* Set the trigger conditions. Returns 0 (no trigger needed) or 1 (trigger
+ * armed); -1 (out of memory) is no longer returned but still handled by
+ * the callers. */
 int hl_build_trigger(struct hl_capture *c, const struct hl_trigger_spec *t);
 
 /* Allocate the capture and history buffers for pre + post samples of

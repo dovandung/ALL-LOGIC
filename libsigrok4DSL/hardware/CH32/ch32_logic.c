@@ -141,11 +141,28 @@ static const struct ch32_samplerate_entry ch32_hw_rates[] = {
 };
 
 /*
+ * 8 channel rates above 200 MS/s (USB3 only): firmware version 3 and later
+ * (SOFTWARE_VERSION 0x03, logic_sys 0x18..0x1B: PLL 300 / 275 / 250 /
+ * 225 MHz with the UHSIF clock undivided, DIV1).
+ * Older firmware treats these codes as its 100 MS/s default, so they are
+ * only offered when the firmware reports version 3 or later.
+ */
+#define CH32_FW_FAST8_VERSION	3
+static const struct ch32_samplerate_entry ch32_fast8_rates[] = {
+	{ 0x18, SR_MHZ(300) },
+	{ 0x19, SR_MHZ(275) },
+	{ 0x1a, SR_MHZ(250) },
+	{ 0x1b, SR_MHZ(225) },
+};
+
+/*
  * UI sample-rate list only: common integer MHz (high → low).
  * Odd HW PLL rates (187.5 / 156.25 / …) stay in ch32_hw_rates for
  * mapping, but are not shown in the combobox.
  */
 static const uint64_t ch32_ui_rates[] = {
+	SR_MHZ(300),	/* 8 channels, firmware >= 3, USB3 */
+	SR_MHZ(250),	/* idem */
 	SR_MHZ(200),
 	SR_MHZ(100),
 	SR_MHZ(50),
@@ -358,8 +375,17 @@ static int ch32_is_usb3_link(const struct ch32_context *devc)
  *   16-bit → DIV20 @ 400M ≈ 20 MS/s
  * USB3 uses full programmable rate table (up to 200 MS/s).
  */
+/* 8 channel rates above 200 MS/s available (USB3, 8 ch, firmware >= 3) */
+static int ch32_fast8_ok(const struct ch32_context *devc)
+{
+	return devc && devc->logic_bit == 8 &&
+	       devc->sw_ver >= CH32_FW_FAST8_VERSION && ch32_is_usb3_link(devc);
+}
+
 static uint64_t ch32_link_max_hw_rate(const struct ch32_context *devc)
 {
+	if (ch32_fast8_ok(devc))
+		return ch32_fast8_rates[0].rate; /* 300M */
 	if (ch32_is_usb3_link(devc))
 		return ch32_hw_rates[0].rate; /* 200M */
 	if (devc && devc->logic_bit == 8)
@@ -510,10 +536,21 @@ static void ch32_map_samplerate(struct ch32_context *devc, uint64_t want)
 		return;
 	}
 
-	/* USB3: try every firmware rate × integer N */
-	for (i = 0; i < ARRAY_SIZE(ch32_hw_rates); i++) {
-		uint64_t hw = ch32_hw_rates[i].rate;
+	/* USB3: try every firmware rate × integer N (the 8 channel rates
+	 * above 200 MS/s first, when the firmware has them) */
+	for (i = 0; i < ARRAY_SIZE(ch32_fast8_rates) + ARRAY_SIZE(ch32_hw_rates); i++) {
+		const struct ch32_samplerate_entry *ent;
+		uint64_t hw;
 		int max_n, n;
+
+		if (i < ARRAY_SIZE(ch32_fast8_rates)) {
+			if (!ch32_fast8_ok(devc))
+				continue;
+			ent = &ch32_fast8_rates[i];
+		} else {
+			ent = &ch32_hw_rates[i - ARRAY_SIZE(ch32_fast8_rates)];
+		}
+		hw = ent->rate;
 
 		if (hw > link_max || hw < CH32_UI_RATE_MIN)
 			continue;
@@ -560,7 +597,7 @@ static void ch32_map_samplerate(struct ch32_context *devc, uint64_t want)
 					best_n = n;
 					best_hw = hw;
 					best_eff = eff;
-					best_sys = ch32_hw_rates[i].logic_sys;
+					best_sys = ent->logic_sys;
 				}
 			}
 			/* N=1 always considered for exact hardware match */
@@ -576,7 +613,7 @@ static void ch32_map_samplerate(struct ch32_context *devc, uint64_t want)
 					best_n = 1;
 					best_hw = hw;
 					best_eff = eff;
-					best_sys = ch32_hw_rates[i].logic_sys;
+					best_sys = ent->logic_sys;
 				}
 			}
 		}
@@ -1188,6 +1225,21 @@ static int ch32_preprocess_append(struct ch32_context *devc,
 	if (!raw || raw_len <= 0)
 		return SR_OK;
 
+	/*
+	 * Fast path, no filter and no decimation: the samples are taken as
+	 * they are. raw_pending is consumed in whole 64-sample groups (bytes),
+	 * so a sample split between two transfers simply waits there.
+	 */
+	if (devc->filter != SR_FILTER_1T && devc->decimate_n <= 1 &&
+	    devc->stream_res_len == 0) {
+		if (ch32_ensure_pending_cap(devc,
+			devc->raw_pending_len + raw_len) != SR_OK)
+			return SR_ERR_MALLOC;
+		memcpy(devc->raw_pending + devc->raw_pending_len, raw, raw_len);
+		devc->raw_pending_len += raw_len;
+		return SR_OK;
+	}
+
 	/* Merge stream residual (half sample from previous URB). */
 	if (devc->stream_res_len > 0) {
 		int need = sample_bytes - devc->stream_res_len;
@@ -1393,7 +1445,7 @@ static int ch32_convert_push(struct ch32_context *devc,
 	const int en = devc->en_count;
 	const int raw_group = CH32_CROSS_SCALE * sample_bytes;
 	const int cross_group = CH32_CROSS_PLANE_BYTES * en;
-	int groups, g, c, i, consumed, left;
+	int groups, consumed, left;
 	uint8_t *out;
 	int out_len;
 	struct sr_datafeed_packet packet;
@@ -1402,6 +1454,16 @@ static int ch32_convert_push(struct ch32_context *devc,
 
 	if (en < 1 || raw_len <= 0)
 		return SR_OK;
+
+	if (devc->trig_mode && devc->filter != SR_FILTER_1T &&
+	    devc->decimate_n <= 1) {
+		/* soft trigger, no filter / decimation: straight into the
+		 * capture core (it joins 16-bit samples split by transfers) */
+		hl_feed_bytes(&devc->cap, raw, (size_t)raw_len);
+		if (devc->cap.state == HL_DONE || devc->cap.state == HL_FAILED)
+			devc->num_samples = devc->limit_samples; /* stop */
+		return devc->cap.state == HL_FAILED ? SR_ERR_MALLOC : SR_OK;
+	}
 
 	if (ch32_preprocess_append(devc, raw, raw_len) != SR_OK)
 		return SR_ERR_MALLOC;
@@ -1443,29 +1505,11 @@ static int ch32_convert_push(struct ch32_context *devc,
 	if (ch32_ensure_cross_cap(devc, out_len) != SR_OK)
 		return SR_ERR_MALLOC;
 
+	/* 8x8 bit transposes (shared with the other drivers) instead of
+	 * one bit at a time; same LA_CROSS_DATA layout */
 	out = devc->cross_buf;
-	for (g = 0; g < groups; g++) {
-		const uint8_t *blk = devc->raw_pending + g * raw_group;
-		for (c = 0; c < en; c++) {
-			uint64_t plane = 0;
-			uint8_t bit = devc->en_bits[c];
-			for (i = 0; i < CH32_CROSS_SCALE; i++) {
-				uint16_t s = ch32_load_sample(
-					blk + i * sample_bytes, sample_bytes);
-				if ((s >> bit) & 1u)
-					plane |= (1ULL << i);
-			}
-			out[0] = (uint8_t)(plane);
-			out[1] = (uint8_t)(plane >> 8);
-			out[2] = (uint8_t)(plane >> 16);
-			out[3] = (uint8_t)(plane >> 24);
-			out[4] = (uint8_t)(plane >> 32);
-			out[5] = (uint8_t)(plane >> 40);
-			out[6] = (uint8_t)(plane >> 48);
-			out[7] = (uint8_t)(plane >> 56);
-			out += CH32_CROSS_PLANE_BYTES;
-		}
-	}
+	hl_to_cross(devc->raw_pending, (uint64_t)groups * CH32_CROSS_SCALE,
+		    devc->en_bits, en, out, (unsigned int)sample_bytes);
 
 	samples_out = (uint64_t)groups * CH32_CROSS_SCALE;
 

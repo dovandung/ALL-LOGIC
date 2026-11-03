@@ -1090,6 +1090,15 @@ static int config_get(int id, GVariant **data, const struct sr_dev_inst *sdi,
 		break;
 	case SR_CONF_LOOP_MODE:
 	case SR_CONF_USB30_SUPPORT:
+		*data = g_variant_new_boolean(TRUE);
+		break;
+	case SR_CONF_USB_SPEED:
+		/* Actual link speed; without it ALL LOGIC shows USB 2.0. */
+		if (!devc || !devc->usb_dev)
+			return SR_ERR;
+		*data = g_variant_new_int32(
+			(int32_t)libusb_get_device_speed(devc->usb_dev));
+		break;
 	case SR_CONF_RLE:
 	case SR_CONF_RLE_SUPPORT:
 		*data = g_variant_new_boolean(FALSE);

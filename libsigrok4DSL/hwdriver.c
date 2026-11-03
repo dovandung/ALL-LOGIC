@@ -115,6 +115,9 @@ extern SR_PRIV struct sr_dev_driver hsdaoh_la_driver_info;
 #ifdef HAVE_CYPRESS_FX3_DEVICE
 extern SR_PRIV struct sr_dev_driver cypress_fx3_driver_info;
 #endif
+#ifdef HAVE_ALIENTEK_DL32_DEVICE
+extern SR_PRIV struct sr_dev_driver alientek_dl32_driver_info;
+#endif
 /** @endcond */
 
 static struct sr_dev_driver *drivers_list[] = {
@@ -145,6 +148,9 @@ static struct sr_dev_driver *drivers_list[] = {
 #endif
 #ifdef HAVE_CYPRESS_FX3_DEVICE
 	&cypress_fx3_driver_info,
+#endif
+#ifdef HAVE_ALIENTEK_DL32_DEVICE
+	&alientek_dl32_driver_info,
 #endif
 	NULL,
 };
@@ -453,7 +459,7 @@ SR_PRIV int ds_scan_all_device_list(libusb_context *usb_ctx,struct libusb_device
 		/* DreamSourceLab + WCH CH32 + SLogic family + PXLogic + ATK-Logic + nanoDLA
 		 * + hsdaoh MS213x HDMI capture sticks
 		 * + Cypress FX3 (cypress-fx3-8 firmware 04B4:1234, ROM boot loader
-		 *   04B4:00F3) */
+		 *   04B4:00F3) + ALIENTEK DL32 / DL32 Plus (04B4:6A6A) */
 		if (des.idVendor == DS_VENDOR_ID ||
 		    (des.idVendor == 0x1A86 &&
 		     (des.idProduct == 0x5537 || des.idProduct == 0x5538 ||
@@ -467,7 +473,8 @@ SR_PRIV int ds_scan_all_device_list(libusb_context *usb_ctx,struct libusb_device
 		    (des.idVendor == 0x345F &&
 		     des.idProduct >= 0x2130 && des.idProduct <= 0x2133) ||
 		    (des.idVendor == 0x04B4 &&
-		     (des.idProduct == 0x1234 || des.idProduct == 0x00F3))) {
+		     (des.idProduct == 0x1234 || des.idProduct == 0x00F3 ||
+		      des.idProduct == 0x6A6A))) {
 			if (wr >= size){
 				sr_err("ds_scan_all_device_list(), buffer length is too short.");
 				break;
