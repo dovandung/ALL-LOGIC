@@ -18,8 +18,9 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          location: C:\        # tools/package_windows.ps1 expects C:\msys64
+          release: false       # the runner's own C:\msys64, where tools/package_windows.ps1 looks
           update: true
+          suppress-deprecation-warnings: msystem-mingw64
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-cmake
