@@ -86,8 +86,28 @@
 
 #define CH32_XFER_TIMEOUT_MS     1000
 #define CH32_BULK_TIMEOUT_MS     200
-#define CH32_NUM_TRANSFERS       8
-#define CH32_TRANSFER_SIZE       (64 * 1024)
+/*
+ * Logic (EP2): 32 x 256 KiB = 8 MiB queued, about 20 ms at 400 MB/s (200 MS/s x
+ * 16 bit). With 8 x 64 KiB (1.3 ms) any stall of the session loop longer than
+ * about 2 ms (with the device's own 256 KiB ring) made the firmware overwrite
+ * buffers that were not sent yet: whole 131072-sample rings went missing
+ * without a trace (measured 5 Nov 2026). Analog (EP3) keeps the old sizes.
+ */
+#define CH32_NUM_TRANSFERS       32
+#define CH32_TRANSFER_SIZE       (256 * 1024)
+#define CH32_XFER_ALIGN          (16 * 1024)   /* whole device buffers / packets */
+#define CH32_ADC_NUM_TRANSFERS   8
+#define CH32_ADC_TRANSFER_SIZE   (64 * 1024)
+
+/*
+ * TraceLA firmware (0x40 and up): 0xC2 returns {0xD2, 6, status, dropped u32
+ * LE, flags}; flags bit 1 = the device's buffers overran (samples lost) since
+ * the last 0xC2 (the query clears it). The original firmware does not answer.
+ */
+#define CMD_TRACE_STATUS         0xC2
+#define CH32_FW_TRACE_STATUS     0x40
+#define CH32_FLAG_OVERRUN        0x02
+#define CH32_STATUS_POLL_US      100000        /* overrun check every 100 ms */
 
 #define CH32_DEFAULT_SAMPLES     SR_Mn(1)
 #define CH32_HW_DEPTH            SR_Mn(16)
@@ -312,6 +332,10 @@ struct ch32_context {
 	int num_transfers;
 	struct libusb_transfer **transfers;
 	int freewheel; /* 1 if using fd=-1 source */
+	int raw_io;              /* WinUSB RAW_IO on the logic endpoint */
+	int raw_io_max;          /* its maximum transfer size, 0 = unknown */
+	gint64 last_status_us;   /* last overrun check */
+	int overrun;             /* the device reported lost samples */
 
 	/* raw sample residual (incomplete 64-sample group) after convert path */
 	uint8_t *raw_pending;
@@ -1737,14 +1761,51 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	}
 }
 
+/*
+ * libusb >= 1.0.30 on WinUSB: RAW_IO on the logic endpoint. Without it WinUSB
+ * keeps one bulk IN read in flight at a time; with it all queued reads stay
+ * in flight. RAW_IO reads must be whole packets and at most the reported
+ * maximum. No effect (and not needed) on other platforms.
+ */
+static void ch32_setup_raw_io(struct ch32_context *devc, uint8_t ep)
+{
+	devc->raw_io = 0;
+	devc->raw_io_max = 0;
+#if defined(_WIN32) && defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x0100010C)
+	if (libusb_endpoint_set_raw_io(devc->devhdl, ep, 1) == LIBUSB_SUCCESS) {
+		int max = libusb_get_max_raw_io_transfer_size(devc->devhdl, ep);
+		devc->raw_io = 1;
+		devc->raw_io_max = max > 0 ? max : 0;
+		sr_info("RAW_IO on ep 0x%02x, max %d bytes", ep, max);
+	} else {
+		sr_info("RAW_IO not available on ep 0x%02x", ep);
+	}
+#else
+	(void)ep;
+#endif
+}
+
 static int start_transfers(struct ch32_context *devc)
 {
 	int i;
 	unsigned char *buf;
 	struct libusb_transfer *xfer;
 	uint8_t ep = devc->acq_analog ? CH32_EP_ADC_IN : CH32_EP_LOGIC_IN;
+	int size = devc->acq_analog ? CH32_ADC_TRANSFER_SIZE : CH32_TRANSFER_SIZE;
 
-	devc->num_transfers = CH32_NUM_TRANSFERS;
+	if (!devc->acq_analog) {
+		ch32_setup_raw_io(devc, ep);
+		if (devc->raw_io_max && size > devc->raw_io_max)
+			size = devc->raw_io_max;
+		size &= ~(CH32_XFER_ALIGN - 1);
+		if (size < CH32_XFER_ALIGN)
+			size = CH32_XFER_ALIGN;
+	}
+	sr_info("USB: %d transfers x %d bytes on ep 0x%02x",
+		devc->acq_analog ? CH32_ADC_NUM_TRANSFERS : CH32_NUM_TRANSFERS, size, ep);
+
+	devc->num_transfers = devc->acq_analog ? CH32_ADC_NUM_TRANSFERS
+					       : CH32_NUM_TRANSFERS;
 	devc->submitted_transfers = 0;
 	devc->transfers = g_try_malloc0(sizeof(struct libusb_transfer *) *
 					devc->num_transfers);
@@ -1752,12 +1813,12 @@ static int start_transfers(struct ch32_context *devc)
 		return SR_ERR_MALLOC;
 
 	for (i = 0; i < devc->num_transfers; i++) {
-		buf = g_try_malloc0(CH32_TRANSFER_SIZE);
+		buf = g_try_malloc0(size);
 		if (!buf)
 			return SR_ERR_MALLOC;
 		xfer = libusb_alloc_transfer(0);
 		libusb_fill_bulk_transfer(xfer, devc->devhdl, ep,
-					  buf, CH32_TRANSFER_SIZE,
+					  buf, size,
 					  receive_transfer, devc,
 					  CH32_BULK_TIMEOUT_MS);
 		if (libusb_submit_transfer(xfer) != 0) {
@@ -1772,6 +1833,30 @@ static int start_transfers(struct ch32_context *devc)
 	return SR_OK;
 }
 
+/* Read and clear the firmware's overrun flag. Not from a transfer callback. */
+static int ch32_read_overrun(struct ch32_context *devc)
+{
+	uint8_t rsp[64];
+	int rlen = 0;
+
+	if (devc->sw_ver < CH32_FW_TRACE_STATUS)
+		return 0;
+	if (ch32_cmd(devc, CMD_TRACE_STATUS, NULL, 0, rsp, &rlen) != SR_OK ||
+	    rlen < 8 || rsp[0] != (CMD_TRACE_STATUS | CMD_RETURN_PARA))
+		return 0;
+	return (rsp[7] & CH32_FLAG_OVERRUN) != 0;
+}
+
+static void ch32_report_overflow(const struct sr_dev_inst *sdi)
+{
+	struct sr_datafeed_packet packet;
+
+	packet.status = SR_PKT_OK;
+	packet.type = SR_DF_OVERFLOW;
+	packet.payload = NULL;
+	ds_data_forward(sdi, &packet);
+}
+
 static int receive_data(int fd, int revents, const struct sr_dev_inst *sdi)
 {
 	struct ch32_context *devc = sdi->priv;
@@ -1784,6 +1869,26 @@ static int receive_data(int fd, int revents, const struct sr_dev_inst *sdi)
 
 	libusb_handle_events_timeout_completed(drvc->sr_ctx->libusb_ctx,
 					       &tv, &completed);
+
+	/*
+	 * Lost samples: the device overwrote buffers the PC had not read yet. The
+	 * data would look continuous with whole rings missing, so report it (ALL
+	 * LOGIC shows its data overflow error) and stop. Only while data still
+	 * counts: after the sample limit the host stops reading and an overrun is
+	 * expected.
+	 */
+	if (devc->fw_streaming && !devc->abort && !devc->acq_analog &&
+	    devc->status == CH32_ST_DATA && !devc->overrun &&
+	    devc->sw_ver >= CH32_FW_TRACE_STATUS &&
+	    g_get_monotonic_time() - devc->last_status_us >= CH32_STATUS_POLL_US) {
+		devc->last_status_us = g_get_monotonic_time();
+		if (ch32_read_overrun(devc)) {
+			devc->overrun = 1;
+			sr_err("CH32: USB too slow, the device lost samples; stopping");
+			ch32_report_overflow(sdi);
+			ch32_request_acq_stop(devc);
+		}
+	}
 
 	/*
 	 * After transfer callbacks return: safe place for sync STOP.
@@ -2706,6 +2811,12 @@ static int hw_dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 		}
 		g_free((void *)lupfd);
 	}
+
+	/* clear an overrun flag left from an earlier run */
+	devc->overrun = 0;
+	devc->last_status_us = g_get_monotonic_time();
+	if (!devc->acq_analog)
+		(void)ch32_read_overrun(devc);
 
 	if (devc->acq_analog)
 		ret = ch32_cmd(devc, CMD_SET_ADC_START, NULL, 0, NULL, NULL);

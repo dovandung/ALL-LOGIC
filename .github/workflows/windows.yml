@@ -1,0 +1,70 @@
+name: Windows build
+
+# MSYS2 MINGW64 build of ALL LOGIC, packaged with tools/package_windows.ps1
+# (portable folder + ZIP). MSYS2 brings libusb 1.0.30, so the drivers that
+# check LIBUSB_API_VERSION (SLogic, CH32H417) use WinUSB RAW_IO.
+
+on:
+  push:
+    branches: [ch32-usb-overrun]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          location: C:\        # tools/package_windows.ps1 expects C:\msys64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-qt5-base
+            mingw-w64-x86_64-qt5-svg
+            mingw-w64-x86_64-qt5-winextras
+            mingw-w64-x86_64-qt5-tools
+            mingw-w64-x86_64-glib2
+            mingw-w64-x86_64-libusb
+            mingw-w64-x86_64-fftw
+            mingw-w64-x86_64-boost
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-zlib
+            git
+
+      - name: libusb version
+        shell: msys2 {0}
+        run: pkgconf --modversion libusb-1.0
+
+      # optional: libhsdaoh for the hsdaoh-la driver (left out if this fails)
+      - name: libhsdaoh (optional)
+        continue-on-error: true
+        shell: msys2 {0}
+        run: |
+          pacman -S --noconfirm --needed mingw-w64-x86_64-libuvc
+          git clone --depth 1 -b la https://github.com/dovandung/hsdaoh.git /tmp/hsdaoh
+          cmake -S /tmp/hsdaoh -B /tmp/hsdaoh/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/mingw64
+          ninja -C /tmp/hsdaoh/build
+          ninja -C /tmp/hsdaoh/build install
+
+      - name: Configure and build
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          ninja -C build
+
+      - name: Package
+        shell: pwsh
+        run: ./tools/package_windows.ps1 -SkipBuild -SkipInstaller
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ALLLOGIC-win64-${{ github.sha }}
+          path: dist/ALLLOGIC-*-win64/
+          if-no-files-found: error
