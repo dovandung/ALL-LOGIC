@@ -49,8 +49,16 @@ jobs:
         run: |
           # libuvc is not packaged for CLANG64: build it
           git clone --depth 1 https://github.com/libuvc/libuvc.git /tmp/libuvc
+          # its FindLibUSB returns early on MinGW and expects LibUSB::LibUSB
+          printf '%s\n' \
+            'find_package(PkgConfig REQUIRED)' \
+            'pkg_check_modules(LIBUSB1 REQUIRED IMPORTED_TARGET libusb-1.0)' \
+            'add_library(LibUSB::LibUSB INTERFACE IMPORTED)' \
+            'target_link_libraries(LibUSB::LibUSB INTERFACE PkgConfig::LIBUSB1)' \
+            > /tmp/libusb_target.cmake
           cmake -S /tmp/libuvc -B /tmp/libuvc/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/clang64 \
+            -DCMAKE_PROJECT_INCLUDE=/tmp/libusb_target.cmake \
             -DBUILD_EXAMPLE=OFF -DBUILD_TEST=OFF
           ninja -C /tmp/libuvc/build install
           git clone --depth 1 -b la https://github.com/dovandung/hsdaoh.git /tmp/hsdaoh
@@ -67,7 +75,13 @@ jobs:
 
       - name: Package
         shell: pwsh
-        run: ./tools/package_windows.ps1 -SkipBuild -SkipInstaller -MsysEnv clang64
+        # the script can end with a stale $LASTEXITCODE (windeployqt warns and is
+        # worked around): judge by its output instead
+        run: |
+          ./tools/package_windows.ps1 -SkipBuild -SkipInstaller -MsysEnv clang64
+          if (-not (Test-Path dist/ALLLOGIC-*-win64.zip)) { exit 1 }
+          Get-ChildItem dist/ALLLOGIC-*-win64 -Filter *.dll | Select-Object Name, Length
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:
