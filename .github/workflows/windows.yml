@@ -1,0 +1,128 @@
+name: Windows build
+
+# MSYS2 CLANG64 build of ALL LOGIC (clang + libc++, as the earlier portable
+# builds), packaged with tools/package_windows.ps1 (portable folder + ZIP).
+# MSYS2 brings libusb 1.0.30 (no longer packaged for MINGW64), so the drivers
+# that check LIBUSB_API_VERSION (SLogic, CH32H417) use WinUSB RAW_IO.
+
+on:
+  push:
+    branches: [main, ch32-usb-overrun]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          release: false       # the runner's own C:\msys64, where tools/package_windows.ps1 looks
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-toolchain
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-qt5-base
+            mingw-w64-clang-x86_64-qt5-svg
+            mingw-w64-clang-x86_64-qt5-winextras
+            mingw-w64-clang-x86_64-qt5-tools
+            mingw-w64-clang-x86_64-glib2
+            mingw-w64-clang-x86_64-libusb
+            mingw-w64-clang-x86_64-fftw
+            mingw-w64-clang-x86_64-boost
+            mingw-w64-clang-x86_64-python
+            mingw-w64-clang-x86_64-zlib
+            git
+
+      - name: libusb version
+        shell: msys2 {0}
+        run: pkgconf --modversion libusb-1.0
+
+      # libuvc + libhsdaoh for the hsdaoh-la driver (Pico 2 + MS2130), built
+      # like the cloud cross build: shared libraries only, no hsdaoh tools
+      # (hsdaoh_file needs libFLAC, which ALL LOGIC does not use)
+      - name: libuvc and libhsdaoh (hsdaoh-la driver)
+        shell: msys2 {0}
+        run: |
+          set -e
+          # libuvc is not packaged for CLANG64: build it
+          git clone --depth 1 https://github.com/libuvc/libuvc.git /tmp/libuvc
+          # its FindLibUSB returns early on MinGW and expects LibUSB::LibUSB
+          printf '%s\n' \
+            'find_package(PkgConfig REQUIRED)' \
+            'pkg_check_modules(LIBUSB1 REQUIRED IMPORTED_TARGET libusb-1.0)' \
+            'add_library(LibUSB::LibUSB INTERFACE IMPORTED)' \
+            'target_link_libraries(LibUSB::LibUSB INTERFACE PkgConfig::LIBUSB1)' \
+            > /tmp/libusb_target.cmake
+          cmake -S /tmp/libuvc -B /tmp/libuvc/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/clang64 \
+            -DCMAKE_PROJECT_INCLUDE=/tmp/libusb_target.cmake \
+            -DCMAKE_C_STANDARD_LIBRARIES=-lpthread \
+            -DCMAKE_BUILD_TARGET=Shared -DDISABLE_JPEG=ON -DENABLE_WARNINGS=OFF \
+            -DBUILD_EXAMPLE=OFF -DBUILD_TEST=OFF
+          ninja -C /tmp/libuvc/build install
+          git clone --depth 1 -b la https://github.com/dovandung/hsdaoh.git /tmp/hsdaoh
+          cmake -S /tmp/hsdaoh -B /tmp/hsdaoh/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/clang64 \
+            -DHSDAOH_BUILD_SHARED=ON -DHSDAOH_BUILD_TOOLS=OFF -DINSTALL_UDEV_RULES=OFF \
+            -DCMAKE_C_STANDARD_LIBRARIES=-lpthread
+          ninja -C /tmp/hsdaoh/build
+          ninja -C /tmp/hsdaoh/build install
+          pkgconf --modversion libuvc libhsdaoh
+
+      - name: Configure and build
+        shell: msys2 {0}
+        run: |
+          set -o pipefail
+          # MSYS2's Python (its stdlib is what gets packaged), not the runner's
+          # own CPython from C:\hostedtoolcache. CMake prints its "----- ..."
+          # summary on stderr, so capture both streams.
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DPython3_ROOT_DIR=/clang64 -DPython3_FIND_REGISTRY=NEVER \
+            -DPython3_FIND_STRATEGY=LOCATION \
+            -DPython3_EXECUTABLE=/clang64/bin/python3.exe 2>&1 | tee cmake.log
+          grep -A2 -- "----- python3:" cmake.log || true
+          if ! grep -q "libhsdaoh (hsdaoh-la driver)" cmake.log; then
+            echo "::error::libhsdaoh not found: the package would have no hsdaoh-la driver"
+            exit 1
+          fi
+          ninja -C build
+
+      - name: Package
+        shell: pwsh
+        # the script can end with a stale $LASTEXITCODE (windeployqt warns and is
+        # worked around): judge by its output instead
+        run: |
+          ./tools/package_windows.ps1 -SkipBuild -SkipInstaller -MsysEnv clang64
+          if (-not (Test-Path dist/ALLLOGIC-*-win64.zip)) { exit 1 }
+          Get-ChildItem dist/ALLLOGIC-*-win64 -Filter *.dll | Select-Object Name, Length
+          foreach ($d in 'libhsdaoh.dll', 'libuvc.dll', 'libusb-1.0.dll') {
+            if (-not (Test-Path "dist/ALLLOGIC-*-win64/$d")) {
+              Write-Output "::error::$d missing from the package"; exit 1
+            }
+          }
+          exit 0
+
+      - name: Check the package has every DLL the exe needs
+        shell: msys2 {0}
+        run: |
+          cd dist/ALLLOGIC-*-win64
+          missing=0
+          for dll in $(llvm-objdump -p AllLogic.exe | sed -n 's/.*DLL Name: //p'); do
+            [ -e "$dll" ] && continue
+            [ -e "/c/Windows/System32/$dll" ] && continue
+            case "$dll" in api-ms-win-*|API-MS-WIN-*|ext-ms-*) continue ;; esac
+            echo "::error::AllLogic.exe needs $dll, which is not in the package"
+            missing=1
+          done
+          exit $missing
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ALLLOGIC-win64-${{ github.sha }}
+          path: dist/ALLLOGIC-*-win64/
+          if-no-files-found: error

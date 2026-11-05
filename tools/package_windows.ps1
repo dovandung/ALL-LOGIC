@@ -14,7 +14,10 @@ param(
     [string]$Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
     [string]$OutDir = "",
     [switch]$SkipBuild,
-    [switch]$SkipInstaller
+    [switch]$SkipInstaller,
+    # MSYS2 environment the build used: mingw64 (default), ucrt64 or clang64
+    [string]$MsysEnv = "mingw64",
+    [string]$MsysRoot = "C:\msys64"
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,9 +25,10 @@ $ErrorActionPreference = "Stop"
 $Version = "1.4.0"
 $PkgName = "ALLLOGIC-$Version-win64"
 $ExeName = "AllLogic.exe"
-$MingwBin = "C:\msys64\mingw64\bin"
-$MingwLib = "C:\msys64\mingw64\lib"
+$MingwBin = Join-Path $MsysRoot "$MsysEnv\bin"
+$MingwLib = Join-Path $MsysRoot "$MsysEnv\lib"
 $Objdump = Join-Path $MingwBin "objdump.exe"
+if (-not (Test-Path $Objdump)) { $Objdump = Join-Path $MingwBin "llvm-objdump.exe" }   # clang64
 $Windeploy = Join-Path $MingwBin "windeployqt-qt5.exe"
 $Ninja = Join-Path $MingwBin "ninja.exe"
 $Makensis = Join-Path $MingwBin "makensis.exe"
@@ -210,7 +214,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # windeployqt may fail on missing libGLESv2; always ensure core plugins exist
 Write-Step "Ensure essential Qt plugins"
-$qtPlug = "C:\msys64\mingw64\share\qt5\plugins"
+$qtPlug = Join-Path $MsysRoot "$MsysEnv\share\qt5\plugins"
 $plugMap = @{
     platforms     = @('qwindows.dll', 'qminimal.dll', 'qoffscreen.dll')
     styles        = @('qwindowsvistastyle.dll')
