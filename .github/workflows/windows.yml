@@ -72,7 +72,13 @@ jobs:
       - name: Configure and build
         shell: msys2 {0}
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release | tee cmake.log
+          # MSYS2's Python (its stdlib is what gets packaged), not the runner's
+          # own CPython from C:\hostedtoolcache
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DPython3_ROOT_DIR=/clang64 -DPython3_FIND_REGISTRY=NEVER \
+            -DPython3_FIND_STRATEGY=LOCATION \
+            -DPython3_EXECUTABLE=/clang64/bin/python3.exe | tee cmake.log
+          grep -A2 -- "----- python3:" cmake.log
           if grep -q "libhsdaoh not found" cmake.log; then
             echo "::warning::libhsdaoh not built: this package has no hsdaoh-la driver"
           fi
@@ -87,6 +93,20 @@ jobs:
           if (-not (Test-Path dist/ALLLOGIC-*-win64.zip)) { exit 1 }
           Get-ChildItem dist/ALLLOGIC-*-win64 -Filter *.dll | Select-Object Name, Length
           exit 0
+
+      - name: Check the package has every DLL the exe needs
+        shell: msys2 {0}
+        run: |
+          cd dist/ALLLOGIC-*-win64
+          missing=0
+          for dll in $(llvm-objdump -p AllLogic.exe | sed -n 's/.*DLL Name: //p'); do
+            [ -e "$dll" ] && continue
+            [ -e "/c/Windows/System32/$dll" ] && continue
+            case "$dll" in api-ms-win-*|API-MS-WIN-*|ext-ms-*) continue ;; esac
+            echo "::error::AllLogic.exe needs $dll, which is not in the package"
+            missing=1
+          done
+          exit $missing
 
       - uses: actions/upload-artifact@v4
         with:
