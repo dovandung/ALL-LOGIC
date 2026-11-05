@@ -29,7 +29,7 @@ ALL LOGIC 二次开发记录。上游 DSView 历史见 `DSView/NEWS`。
 - 修复 16 通道 @200MHz 采集时静默丢数据：USB 队列只有 8 × 64 KB（约 1.3 ms），会话循环一卡顿超过约 2 ms，设备就覆盖尚未发送的缓冲区，整段 131072 个样本（0.655 ms）消失而波形看上去仍然连续。实测（2026-11-05，模 65521 计数器）一次 100 ms 采集丢了约 48 段、约 31 ms。现在逻辑端点排队 32 × 256 KB（约 20 ms），模拟端点保持原值。
 - libusb ≥ 1.0.30（MSYS2 当前版本）时在逻辑端点打开 WinUSB RAW_IO，所有排队的读请求同时在途；传输大小按 16 KB 对齐并不超过 RAW_IO 上限。
 - TraceLA 固件（0x40 及以上）：采集中每 100 ms 用 0xC2 查询设备溢出标志；一旦设备丢了数据，发 `SR_DF_OVERFLOW`（界面显示数据溢出错误）并停止，不再显示拼接过的数据。开始前先读一次以清除旧标志。
-- 新增 GitHub Actions Windows 构建（`.github/workflows/windows.yml`，MSYS2 MINGW64，产出便携包）。
+- 新增 GitHub Actions Windows 构建（`.github/workflows/windows.yml`，MSYS2 CLANG64，libusb 1.0.30，产出便携包）。
 
 ### 其它
 

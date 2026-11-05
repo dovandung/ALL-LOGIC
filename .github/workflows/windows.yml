@@ -7,7 +7,7 @@ name: Windows build
 
 on:
   push:
-    branches: [ch32-usb-overrun]
+    branches: [main, ch32-usb-overrun]
   workflow_dispatch:
 
 jobs:
