@@ -42,11 +42,13 @@ jobs:
         shell: msys2 {0}
         run: pkgconf --modversion libusb-1.0
 
-      # optional: libhsdaoh for the hsdaoh-la driver (left out if this fails)
-      - name: libhsdaoh (optional)
-        continue-on-error: true
+      # libuvc + libhsdaoh for the hsdaoh-la driver (Pico 2 + MS2130), built
+      # like the cloud cross build: shared libraries only, no hsdaoh tools
+      # (hsdaoh_file needs libFLAC, which ALL LOGIC does not use)
+      - name: libuvc and libhsdaoh (hsdaoh-la driver)
         shell: msys2 {0}
         run: |
+          set -e
           # libuvc is not packaged for CLANG64: build it
           git clone --depth 1 https://github.com/libuvc/libuvc.git /tmp/libuvc
           # its FindLibUSB returns early on MinGW and expects LibUSB::LibUSB
@@ -60,27 +62,33 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/clang64 \
             -DCMAKE_PROJECT_INCLUDE=/tmp/libusb_target.cmake \
             -DCMAKE_C_STANDARD_LIBRARIES=-lpthread \
+            -DCMAKE_BUILD_TARGET=Shared -DDISABLE_JPEG=ON -DENABLE_WARNINGS=OFF \
             -DBUILD_EXAMPLE=OFF -DBUILD_TEST=OFF
           ninja -C /tmp/libuvc/build install
           git clone --depth 1 -b la https://github.com/dovandung/hsdaoh.git /tmp/hsdaoh
           cmake -S /tmp/hsdaoh -B /tmp/hsdaoh/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/clang64 \
+            -DHSDAOH_BUILD_SHARED=ON -DHSDAOH_BUILD_TOOLS=OFF -DINSTALL_UDEV_RULES=OFF \
             -DCMAKE_C_STANDARD_LIBRARIES=-lpthread
           ninja -C /tmp/hsdaoh/build
           ninja -C /tmp/hsdaoh/build install
+          pkgconf --modversion libuvc libhsdaoh
 
       - name: Configure and build
         shell: msys2 {0}
         run: |
+          set -o pipefail
           # MSYS2's Python (its stdlib is what gets packaged), not the runner's
-          # own CPython from C:\hostedtoolcache
+          # own CPython from C:\hostedtoolcache. CMake prints its "----- ..."
+          # summary on stderr, so capture both streams.
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DPython3_ROOT_DIR=/clang64 -DPython3_FIND_REGISTRY=NEVER \
             -DPython3_FIND_STRATEGY=LOCATION \
-            -DPython3_EXECUTABLE=/clang64/bin/python3.exe | tee cmake.log
-          grep -A2 -- "----- python3:" cmake.log
-          if grep -q "libhsdaoh not found" cmake.log; then
-            echo "::warning::libhsdaoh not built: this package has no hsdaoh-la driver"
+            -DPython3_EXECUTABLE=/clang64/bin/python3.exe 2>&1 | tee cmake.log
+          grep -A2 -- "----- python3:" cmake.log || true
+          if ! grep -q "libhsdaoh (hsdaoh-la driver)" cmake.log; then
+            echo "::error::libhsdaoh not found: the package would have no hsdaoh-la driver"
+            exit 1
           fi
           ninja -C build
 
@@ -92,6 +100,11 @@ jobs:
           ./tools/package_windows.ps1 -SkipBuild -SkipInstaller -MsysEnv clang64
           if (-not (Test-Path dist/ALLLOGIC-*-win64.zip)) { exit 1 }
           Get-ChildItem dist/ALLLOGIC-*-win64 -Filter *.dll | Select-Object Name, Length
+          foreach ($d in 'libhsdaoh.dll', 'libuvc.dll', 'libusb-1.0.dll') {
+            if (-not (Test-Path "dist/ALLLOGIC-*-win64/$d")) {
+              Write-Output "::error::$d missing from the package"; exit 1
+            }
+          }
           exit 0
 
       - name: Check the package has every DLL the exe needs
