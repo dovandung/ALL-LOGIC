@@ -59,18 +59,23 @@ jobs:
           cmake -S /tmp/libuvc -B /tmp/libuvc/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/clang64 \
             -DCMAKE_PROJECT_INCLUDE=/tmp/libusb_target.cmake \
+            -DCMAKE_C_STANDARD_LIBRARIES=-lpthread \
             -DBUILD_EXAMPLE=OFF -DBUILD_TEST=OFF
           ninja -C /tmp/libuvc/build install
           git clone --depth 1 -b la https://github.com/dovandung/hsdaoh.git /tmp/hsdaoh
           cmake -S /tmp/hsdaoh -B /tmp/hsdaoh/build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/clang64
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/clang64 \
+            -DCMAKE_C_STANDARD_LIBRARIES=-lpthread
           ninja -C /tmp/hsdaoh/build
           ninja -C /tmp/hsdaoh/build install
 
       - name: Configure and build
         shell: msys2 {0}
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release | tee cmake.log
+          if grep -q "libhsdaoh not found" cmake.log; then
+            echo "::warning::libhsdaoh not built: this package has no hsdaoh-la driver"
+          fi
           ninja -C build
 
       - name: Package
